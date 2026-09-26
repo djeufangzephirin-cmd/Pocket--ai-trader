@@ -2,7 +2,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List
-import math
 
 
 # ============================================================
@@ -12,7 +11,7 @@ import math
 app = FastAPI(
     title="Pocket AI Trader",
     description="Moteur d'analyse technique Forex",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 app.add_middleware(
@@ -47,6 +46,7 @@ class AnalyzeRequest(BaseModel):
 # ============================================================
 
 def calculate_ema(values: List[float], period: int) -> float:
+
     if len(values) < period:
         return sum(values) / len(values)
 
@@ -61,6 +61,7 @@ def calculate_ema(values: List[float], period: int) -> float:
 
 
 def calculate_rsi(values: List[float], period: int = 14) -> float:
+
     if len(values) <= period:
         return 50.0
 
@@ -68,11 +69,13 @@ def calculate_rsi(values: List[float], period: int = 14) -> float:
     losses = []
 
     for i in range(1, len(values)):
+
         change = values[i] - values[i - 1]
 
         if change > 0:
             gains.append(change)
             losses.append(0)
+
         else:
             gains.append(0)
             losses.append(abs(change))
@@ -81,12 +84,20 @@ def calculate_rsi(values: List[float], period: int = 14) -> float:
     avg_loss = sum(losses[:period]) / period
 
     for i in range(period, len(gains)):
-        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
-        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
+
+        avg_gain = (
+            (avg_gain * (period - 1)) + gains[i]
+        ) / period
+
+        avg_loss = (
+            (avg_loss * (period - 1)) + losses[i]
+        ) / period
 
     if avg_loss == 0:
+
         if avg_gain == 0:
             return 50.0
+
         return 100.0
 
     rs = avg_gain / avg_loss
@@ -95,6 +106,7 @@ def calculate_rsi(values: List[float], period: int = 14) -> float:
 
 
 def calculate_momentum(values: List[float], period: int = 5) -> float:
+
     if len(values) <= period:
         return 0.0
 
@@ -115,7 +127,12 @@ def analyze_market(data: AnalyzeRequest):
 
     candles = data.candles
 
+    # --------------------------------------------------------
+    # VALIDATION
+    # --------------------------------------------------------
+
     if len(candles) < 25:
+
         raise HTTPException(
             status_code=400,
             detail="Au moins 25 bougies sont nécessaires."
@@ -123,33 +140,39 @@ def analyze_market(data: AnalyzeRequest):
 
     closes = [c.close for c in candles]
 
-    # --------------------------------------------------------
+    # ========================================================
     # INDICATEURS
-    # --------------------------------------------------------
+    # ========================================================
 
     ema9 = calculate_ema(closes, 9)
+
     ema21 = calculate_ema(closes, 21)
+
     rsi14 = calculate_rsi(closes, 14)
+
     momentum5 = calculate_momentum(closes, 5)
 
     last_candle = candles[-1]
 
-    # --------------------------------------------------------
-    # DIRECTION DE LA DERNIERE BOUGIE
-    # --------------------------------------------------------
+    # ========================================================
+    # DIRECTION DERNIERE BOUGIE
+    # ========================================================
 
     if last_candle.close > last_candle.open:
+
         candle_direction = "BULLISH"
 
     elif last_candle.close < last_candle.open:
+
         candle_direction = "BEARISH"
 
     else:
+
         candle_direction = "NEUTRAL"
 
-    # --------------------------------------------------------
+    # ========================================================
     # RANGE MOYEN
-    # --------------------------------------------------------
+    # ========================================================
 
     ranges = [
         candle.high - candle.low
@@ -163,84 +186,142 @@ def analyze_market(data: AnalyzeRequest):
     # ========================================================
 
     score = 0
+
     reasons = []
 
-    # --------------------------------------------------------
-    # 1. EMA
-    # --------------------------------------------------------
+    # ========================================================
+    # 1. EMA AVEC ZONE NEUTRE
+    # ========================================================
 
-    if ema9 > ema21:
+    EMA_SEPARATION_THRESHOLD = 0.0005
+
+    ema_difference = abs(ema9 - ema21)
+
+    ema_threshold = closes[-1] * EMA_SEPARATION_THRESHOLD
+
+    if ema_difference <= ema_threshold:
+
+        ema_signal = 0
+
+        ema_state = "NEUTRAL"
+
+        reasons.append(
+            "EMA9 et EMA21 proches - zone neutre"
+        )
+
+    elif ema9 > ema21:
+
+        ema_signal = 2
+
+        ema_state = "BULLISH"
 
         score += 2
 
-        reasons.append("EMA9 au-dessus EMA21")
+        reasons.append(
+            "EMA9 au-dessus EMA21"
+        )
 
-    elif ema9 < ema21:
+    else:
+
+        ema_signal = -2
+
+        ema_state = "BEARISH"
 
         score -= 2
 
-        reasons.append("EMA9 sous EMA21")
+        reasons.append(
+            "EMA9 sous EMA21"
+        )
 
-    # --------------------------------------------------------
+    # ========================================================
     # 2. RSI
-    # --------------------------------------------------------
+    # ========================================================
 
     if rsi14 >= 70:
 
         score += 1
 
-        reasons.append("RSI en zone de surachat")
+        reasons.append(
+            "RSI en zone de surachat"
+        )
 
     elif rsi14 <= 30:
 
         score -= 1
 
-        reasons.append("RSI en zone de survente")
+        reasons.append(
+            "RSI en zone de survente"
+        )
 
-    # --------------------------------------------------------
+    # ========================================================
     # 3. MOMENTUM
-    # --------------------------------------------------------
+    # ========================================================
 
     if momentum5 > 0:
 
         score += 1
 
-        reasons.append("Momentum positif")
+        reasons.append(
+            "Momentum positif"
+        )
 
     elif momentum5 < 0:
 
         score -= 1
 
-        reasons.append("Momentum négatif")
+        reasons.append(
+            "Momentum négatif"
+        )
 
-    # --------------------------------------------------------
-    # 4. CONFIRMATION PAR LA DERNIERE BOUGIE
-    # --------------------------------------------------------
+    # ========================================================
+    # 4. DERNIERE BOUGIE
+    # ========================================================
 
     if candle_direction == "BULLISH":
 
         score += 1
 
-        reasons.append("Dernière bougie haussière")
+        reasons.append(
+            "Dernière bougie haussière"
+        )
 
     elif candle_direction == "BEARISH":
 
         score -= 1
 
-        reasons.append("Dernière bougie baissière")
+        reasons.append(
+            "Dernière bougie baissière"
+        )
 
     # ========================================================
     # TENDANCE
     # ========================================================
 
-    if ema9 > ema21:
+    if ema_state == "BULLISH":
+
         trend = "BULLISH"
 
-    elif ema9 < ema21:
+    elif ema_state == "BEARISH":
+
         trend = "BEARISH"
 
     else:
-        trend = "NEUTRAL"
+
+        # Lorsque les EMA sont dans la zone neutre,
+        # on utilise le score pour détecter une éventuelle
+        # pression directionnelle sans forcer une tendance.
+
+        if score >= 3:
+
+            trend = "BULLISH"
+
+        elif score <= -3:
+
+            trend = "BEARISH"
+
+        else:
+
+            trend = "NEUTRAL"
 
     # ========================================================
     # SIGNAL
@@ -270,7 +351,6 @@ def analyze_market(data: AnalyzeRequest):
 
         confidence = 50 + (abs(score) * 10)
 
-        # Limite maximale
         confidence = min(confidence, 95)
 
     # ========================================================
@@ -278,25 +358,44 @@ def analyze_market(data: AnalyzeRequest):
     # ========================================================
 
     return {
+
         "status": "success",
+
         "asset": data.asset,
+
         "timeframe": data.timeframe,
+
         "price": closes[-1],
+
         "signal": signal,
+
         "confidence": confidence,
+
         "score": score,
+
         "trend": trend,
 
         "indicators": {
+
             "ema9": round(ema9, 6),
+
             "ema21": round(ema21, 6),
+
             "rsi14": round(rsi14, 6),
+
             "momentum_5": round(momentum5, 6)
+
         },
 
         "market": {
+
             "candle_direction": candle_direction,
-            "average_range": round(average_range, 6)
+
+            "average_range": round(
+                average_range,
+                6
+            )
+
         },
 
         "reasons": reasons,
@@ -304,14 +403,23 @@ def analyze_market(data: AnalyzeRequest):
         "candles_count": len(candles),
 
         "candles": [
+
             {
+
                 "open": c.open,
+
                 "high": c.high,
+
                 "low": c.low,
+
                 "close": c.close
+
             }
+
             for c in candles
+
         ]
+
     }
 
 
@@ -323,8 +431,13 @@ def analyze_market(data: AnalyzeRequest):
 def root():
 
     return {
+
         "status": "online",
+
         "service": "Pocket AI Trader",
-        "version": "2.0.0",
+
+        "version": "2.1.0",
+
         "endpoint": "/analyze"
+
     }
