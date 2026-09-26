@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+
+browser_profile/
+__pycache__/
+*.py[cod]
+*.log
+
+.venv/
+venv/
