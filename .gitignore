@@ -6,9 +6,3 @@ browser_profile/
 __pycache__/
 *.py[cod]
 *.log
-
-.venv/
-venv/
-.env
-__pycache__/
-*.pyc
