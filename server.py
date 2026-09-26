@@ -1,8 +1,22 @@
+from __future__ import annotations
+
+import math
+import os
+from typing import List, Optional
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import List, Optional
-import math
+from pydantic import BaseModel, Field, field_validator
+
+from Config import (
+    APP_NAME,
+    APP_VERSION,
+    MIN_CANDLES,
+    MIN_CONFIDENCE,
+    EMA_FAST_PERIOD,
+    EMA_SLOW_PERIOD,
+    RSI_PERIOD,
+)
 
 
 # ============================================================
@@ -10,9 +24,9 @@ import math
 # ============================================================
 
 app = FastAPI(
-    title="Pocket AI Trader",
+    title=APP_NAME,
     description="API d'analyse technique pour Pocket AI Trader",
-    version="2.0.0"
+    version=APP_VERSION,
 )
 
 
@@ -20,12 +34,29 @@ app = FastAPI(
 # CORS
 # ============================================================
 
+# CORS_ORIGINS peut être défini dans .env.
+# Exemple :
+# CORS_ORIGINS=https://mon-frontend.com,http://localhost:3000
+
+cors_origins_raw = os.getenv("CORS_ORIGINS", "").strip()
+
+if cors_origins_raw:
+    cors_origins = [
+        origin.strip()
+        for origin in cors_origins_raw.split(",")
+        if origin.strip()
+    ]
+else:
+    # Aucun frontend externe autorisé par défaut.
+    cors_origins = []
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 
@@ -34,23 +65,88 @@ app.add_middleware(
 # ============================================================
 
 class Candle(BaseModel):
-    open: float
-    high: float
-    low: float
-    close: float
+    open: float = Field(..., gt=0)
+    high: float = Field(..., gt=0)
+    low: float = Field(..., gt=0)
+    close: float = Field(..., gt=0)
+
+    @field_validator("open", "high", "low", "close")
+    @classmethod
+    def validate_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("Les valeurs OHLC doivent être des nombres finis.")
+        return value
+
+    @field_validator("high")
+    @classmethod
+    def validate_high(cls, value: float, info):
+        data = info.data
+
+        if "open" in data and value < data["open"]:
+            raise ValueError("high doit être supérieur ou égal à open.")
+
+        if "close" in data and value < data["close"]:
+            raise ValueError("high doit être supérieur ou égal à close.")
+
+        return value
+
+    @field_validator("low")
+    @classmethod
+    def validate_low(cls, value: float, info):
+        data = info.data
+
+        if "open" in data and value > data["open"]:
+            raise ValueError("low doit être inférieur ou égal à open.")
+
+        if "close" in data and value > data["close"]:
+            raise ValueError("low doit être inférieur ou égal à close.")
+
+        return value
 
 
 class AnalyzeRequest(BaseModel):
-    asset: str = Field(..., example="EURUSD")
-    timeframe: str = Field(..., example="1m")
+    asset: str = Field(..., min_length=1, max_length=30)
+    timeframe: str = Field(..., min_length=1, max_length=10)
     candles: List[Candle]
+
+    @field_validator("asset")
+    @classmethod
+    def validate_asset(cls, value: str) -> str:
+        value = value.strip().upper()
+
+        if not value:
+            raise ValueError("asset ne peut pas être vide.")
+
+        return value
+
+    @field_validator("timeframe")
+    @classmethod
+    def validate_timeframe(cls, value: str) -> str:
+        value = value.strip().lower()
+
+        if not value:
+            raise ValueError("timeframe ne peut pas être vide.")
+
+        return value
 
 
 class MarketData(BaseModel):
-    asset: str = Field(..., example="EURUSD")
+    asset: str = Field(..., min_length=1, max_length=30)
     price: float = Field(..., gt=0)
     previous_price: Optional[float] = Field(None, gt=0)
-    timeframe: str = Field("1m", example="1m")
+    timeframe: str = Field("1m", min_length=1, max_length=10)
+
+    @field_validator("price", "previous_price")
+    @classmethod
+    def validate_finite(cls, value):
+        if value is not None and not math.isfinite(value):
+            raise ValueError("Le prix doit être un nombre fini.")
+        return value
+
+    @field_validator("asset")
+    @classmethod
+    def validate_asset(cls, value: str) -> str:
+        return value.strip().upper()
 
 
 # ============================================================
@@ -60,8 +156,8 @@ class MarketData(BaseModel):
 @app.get("/")
 def root():
     return {
-        "name": "Pocket AI Trader",
-        "version": "2.0.0",
+        "name": APP_NAME,
+        "version": APP_VERSION,
         "status": "online",
         "message": "Pocket AI Trader API is running",
         "endpoints": [
@@ -69,9 +165,10 @@ def root():
             "/health",
             "/analyze",
             "/quick-analysis",
-            "/docs"
-        ]
+            "/docs",
+        ],
     }
+
 
 # ============================================================
 # HEALTH CHECK
@@ -82,7 +179,7 @@ def health():
     return {
         "status": "healthy",
         "service": "pocket-ai-trader",
-        "version": "2.0.0"
+        "version": APP_VERSION,
     }
 
 
@@ -90,7 +187,11 @@ def health():
 # EMA
 # ============================================================
 
-def calculate_ema(values: List[float], period: int) -> float:
+def calculate_ema(
+    values: List[float],
+    period: int,
+) -> float:
+
     if len(values) < period:
         raise ValueError(
             f"Il faut au moins {period} valeurs pour calculer l'EMA."
@@ -110,11 +211,15 @@ def calculate_ema(values: List[float], period: int) -> float:
 # RSI
 # ============================================================
 
-def calculate_rsi(values: List[float], period: int = 14) -> float:
+def calculate_rsi(
+    values: List[float],
+    period: int = RSI_PERIOD,
+) -> float:
 
     if len(values) < period + 1:
         raise ValueError(
-            f"Il faut au moins {period + 1} clôtures pour calculer le RSI."
+            f"Il faut au moins {period + 1} clôtures "
+            f"pour calculer le RSI."
         )
 
     gains = []
@@ -125,9 +230,9 @@ def calculate_rsi(values: List[float], period: int = 14) -> float:
 
         if difference > 0:
             gains.append(difference)
-            losses.append(0)
+            losses.append(0.0)
         else:
-            gains.append(0)
+            gains.append(0.0)
             losses.append(abs(difference))
 
     average_gain = sum(gains[:period]) / period
@@ -156,7 +261,10 @@ def calculate_rsi(values: List[float], period: int = 14) -> float:
 # MOMENTUM
 # ============================================================
 
-def calculate_momentum(values: List[float], period: int = 5) -> float:
+def calculate_momentum(
+    values: List[float],
+    period: int = 5,
+) -> float:
 
     if len(values) <= period:
         return 0.0
@@ -174,12 +282,15 @@ def calculate_momentum(values: List[float], period: int = 5) -> float:
 # TREND
 # ============================================================
 
-def determine_trend(ema9: float, ema20: float) -> str:
+def determine_trend(
+    fast_ema: float,
+    slow_ema: float,
+) -> str:
 
-    if ema9 > ema20:
+    if fast_ema > slow_ema:
         return "BULLISH"
 
-    if ema9 < ema20:
+    if fast_ema < slow_ema:
         return "BEARISH"
 
     return "NEUTRAL"
@@ -191,11 +302,10 @@ def determine_trend(ema9: float, ema20: float) -> str:
 
 def generate_signal(
     rsi: float,
-    ema9: float,
-    ema20: float,
-    momentum: float
+    fast_ema: float,
+    slow_ema: float,
+    momentum: float,
 ):
-
     score = 0
     reasons = []
 
@@ -203,13 +313,19 @@ def generate_signal(
     # EMA
     # --------------------------------------------------------
 
-    if ema9 > ema20:
+    if fast_ema > slow_ema:
         score += 2
-        reasons.append("EMA9 au-dessus de EMA20")
+        reasons.append(
+            f"EMA{EMA_FAST_PERIOD} au-dessus de "
+            f"EMA{EMA_SLOW_PERIOD}"
+        )
 
-    elif ema9 < ema20:
+    elif fast_ema < slow_ema:
         score -= 2
-        reasons.append("EMA9 sous EMA20")
+        reasons.append(
+            f"EMA{EMA_FAST_PERIOD} sous "
+            f"EMA{EMA_SLOW_PERIOD}"
+        )
 
     # --------------------------------------------------------
     # RSI
@@ -244,7 +360,7 @@ def generate_signal(
         reasons.append("Momentum négatif")
 
     # --------------------------------------------------------
-    # SIGNAL
+    # SIGNAL BRUT
     # --------------------------------------------------------
 
     if score >= 3:
@@ -260,14 +376,24 @@ def generate_signal(
     # CONFIDENCE
     # --------------------------------------------------------
 
-    # Score théorique maximum = +4 / -4
+    # Score maximum théorique = 4
     confidence = min(abs(score) / 4 * 100, 95)
 
-    # WAIT ne doit pas afficher une confiance artificiellement élevée
-    if signal == "WAIT":
-        confidence = min(confidence, 55)
-
     confidence = round(confidence, 1)
+
+    # --------------------------------------------------------
+    # FILTRE DE CONFIDENCE
+    # --------------------------------------------------------
+
+    if signal != "WAIT" and confidence < MIN_CONFIDENCE:
+        signal = "WAIT"
+        reasons.append(
+            f"Confiance inférieure au seuil configuré "
+            f"({MIN_CONFIDENCE}%)"
+        )
+
+    if signal == "WAIT":
+        confidence = min(confidence, 55.0)
 
     return signal, confidence, score, reasons
 
@@ -280,34 +406,49 @@ def generate_signal(
 def analyze_market(request: AnalyzeRequest):
 
     # --------------------------------------------------------
-    # Validation
+    # Validation du nombre de bougies
     # --------------------------------------------------------
 
-    if len(request.candles) < 20:
+    if len(request.candles) < MIN_CANDLES:
         raise HTTPException(
             status_code=400,
-            detail="Minimum 20 bougies nécessaires pour l'analyse."
+            detail=(
+                f"Minimum {MIN_CANDLES} bougies nécessaires "
+                f"pour l'analyse."
+            ),
         )
 
     closes = [c.close for c in request.candles]
-
-    highs = [c.high for c in request.candles]
-    lows = [c.low for c in request.candles]
 
     # --------------------------------------------------------
     # Calculs
     # --------------------------------------------------------
 
     try:
-        ema9 = calculate_ema(closes, 9)
-        ema20 = calculate_ema(closes, 20)
-        rsi14 = calculate_rsi(closes, 14)
-        momentum = calculate_momentum(closes, 5)
+        fast_ema = calculate_ema(
+            closes,
+            EMA_FAST_PERIOD,
+        )
+
+        slow_ema = calculate_ema(
+            closes,
+            EMA_SLOW_PERIOD,
+        )
+
+        rsi = calculate_rsi(
+            closes,
+            RSI_PERIOD,
+        )
+
+        momentum = calculate_momentum(
+            closes,
+            5,
+        )
 
     except ValueError as error:
         raise HTTPException(
             status_code=400,
-            detail=str(error)
+            detail=str(error),
         )
 
     # --------------------------------------------------------
@@ -315,8 +456,8 @@ def analyze_market(request: AnalyzeRequest):
     # --------------------------------------------------------
 
     trend = determine_trend(
-        ema9,
-        ema20
+        fast_ema,
+        slow_ema,
     )
 
     # --------------------------------------------------------
@@ -324,10 +465,10 @@ def analyze_market(request: AnalyzeRequest):
     # --------------------------------------------------------
 
     signal, confidence, score, reasons = generate_signal(
-        rsi14,
-        ema9,
-        ema20,
-        momentum
+        rsi,
+        fast_ema,
+        slow_ema,
+        momentum,
     )
 
     # --------------------------------------------------------
@@ -342,19 +483,21 @@ def analyze_market(request: AnalyzeRequest):
     # Volatilité simple
     # --------------------------------------------------------
 
+    recent_candles = request.candles[-10:]
+
     recent_ranges = [
         candle.high - candle.low
-        for candle in request.candles[-10:]
+        for candle in recent_candles
     ]
 
     average_range = (
         sum(recent_ranges) / len(recent_ranges)
         if recent_ranges
-        else 0
+        else 0.0
     )
 
     # --------------------------------------------------------
-    # Direction du prix
+    # Direction de la dernière bougie
     # --------------------------------------------------------
 
     if last_candle.close > last_candle.open:
@@ -372,31 +515,36 @@ def analyze_market(request: AnalyzeRequest):
 
     return {
         "status": "success",
-
         "asset": request.asset,
-
         "timeframe": request.timeframe,
-
         "price": round(current_price, 6),
-
         "signal": signal,
-
         "confidence": confidence,
-
         "score": score,
-
         "trend": trend,
 
         "indicators": {
-            "rsi14": rsi14,
-            "ema9": round(ema9, 6),
-            "ema20": round(ema20, 6),
-            "momentum_5": round(momentum, 6)
+            f"ema{EMA_FAST_PERIOD}": round(
+                fast_ema,
+                6,
+            ),
+            f"ema{EMA_SLOW_PERIOD}": round(
+                slow_ema,
+                6,
+            ),
+            f"rsi{RSI_PERIOD}": rsi,
+            "momentum_5": round(
+                momentum,
+                6,
+            ),
         },
 
         "market": {
             "candle_direction": candle_direction,
-            "average_range": round(average_range, 6)
+            "average_range": round(
+                average_range,
+                6,
+            ),
         },
 
         "reasons": reasons,
@@ -408,10 +556,10 @@ def analyze_market(request: AnalyzeRequest):
                 "open": candle.open,
                 "high": candle.high,
                 "low": candle.low,
-                "close": candle.close
+                "close": candle.close,
             }
             for candle in request.candles
-        ]
+        ],
     }
 
 
@@ -425,7 +573,10 @@ def quick_analysis(data: MarketData):
     if data.previous_price is None:
         raise HTTPException(
             status_code=400,
-            detail="previous_price est nécessaire pour calculer la variation."
+            detail=(
+                "previous_price est nécessaire "
+                "pour calculer la variation."
+            ),
         )
 
     variation = (
@@ -448,8 +599,11 @@ def quick_analysis(data: MarketData):
         "timeframe": data.timeframe,
         "price": data.price,
         "previous_price": data.previous_price,
-        "variation_percent": round(variation, 4),
-        "direction": direction
+        "variation_percent": round(
+            variation,
+            4,
+        ),
+        "direction": direction,
     }
 
 
@@ -460,9 +614,16 @@ def quick_analysis(data: MarketData):
 if __name__ == "__main__":
     import uvicorn
 
+    port = int(
+        os.getenv(
+            "PORT",
+            "8000",
+        )
+    )
+
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
-        port=8000,
-        reload=True
+        port=port,
+        reload=False,
     )
