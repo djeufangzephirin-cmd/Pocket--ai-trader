@@ -1,15 +1,10 @@
-# ============================================================
-# POCKET AI TRADER - SERVER V3
-# Moteur d'analyse technique Forex
-# FastAPI + Twelve Data
-# ============================================================
-
 import os
-import math
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
+import numpy as np
+import pandas as pd
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -18,15 +13,10 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================
 
-APP_VERSION = "3.0.0"
-
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
-
-TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
-
-DEFAULT_SYMBOL = "EUR/USD"
-DEFAULT_TIMEFRAME = "15min"
-DEFAULT_OUTPUTSIZE = 100
+APP_VERSION = "4.0.0"
+ASSET = "EURUSD"
+TIMEFRAME = "15m"
+CANDLE_LIMIT = 100
 
 
 # ============================================================
@@ -35,8 +25,8 @@ DEFAULT_OUTPUTSIZE = 100
 
 app = FastAPI(
     title="Pocket AI Trader",
-    description="Moteur d'analyse technique Forex avec données réelles",
-    version=APP_VERSION,
+    description="Moteur d'analyse technique Forex avec donnees reelles",
+    version="4.0.0",
 )
 
 app.add_middleware(
@@ -49,7 +39,7 @@ app.add_middleware(
 
 
 # ============================================================
-# MODELES
+# MODELS
 # ============================================================
 
 class Candle(BaseModel):
@@ -57,240 +47,302 @@ class Candle(BaseModel):
     high: float
     low: float
     close: float
-    volume: Optional[float] = 0
+    volume: float = 0.0
 
 
 class AnalyzeRequest(BaseModel):
-    asset: str = "EURUSD"
-    timeframe: str = "15m"
-    candles: List[Candle] = Field(..., min_length=30)
+    asset: str = Field(default=ASSET)
+    timeframe: str = Field(default=TIMEFRAME)
+    candles: List[Candle] = Field(min_length=30)
 
 
 # ============================================================
-# OUTILS
+# TWELVE DATA
 # ============================================================
 
-def normalize_symbol(asset: str) -> str:
-    """
-    EURUSD -> EUR/USD
-    EUR/USD -> EUR/USD
-    """
-    asset = asset.upper().strip()
+def get_api_key() -> str:
+    key = os.getenv("TWELVE_DATA_API_KEY")
 
-    if "/" in asset:
-        return asset
+    if not key:
+        raise HTTPException(
+            status_code=500,
+            detail="La variable TWELVE_DATA_API_KEY n'est pas configuree sur Render.",
+        )
 
-    if len(asset) == 6:
-        return f"{asset[:3]}/{asset[3:]}"
-
-    return asset
+    return key
 
 
-def normalize_interval(timeframe: str) -> str:
-    """
-    15m -> 15min
-    5m  -> 5min
-    1h  -> 1h
-    """
-    tf = timeframe.lower().strip()
+def fetch_candles(
+    asset: str = ASSET,
+    timeframe: str = TIMEFRAME,
+    outputsize: int = CANDLE_LIMIT,
+) -> List[Dict[str, float]]:
 
-    mapping = {
-        "1m": "1min",
-        "5m": "5min",
-        "15m": "15min",
-        "30m": "30min",
-        "1h": "1h",
-        "4h": "4h",
-        "1d": "1day",
+    key = get_api_key()
+
+    url = "https://api.twelvedata.com/time_series"
+
+    params = {
+        "symbol": asset,
+        "interval": timeframe,
+        "outputsize": outputsize,
+        "apikey": key,
+        "format": "JSON",
+        "order": "ASC",
     }
 
-    return mapping.get(tf, tf)
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            timeout=15,
+        )
+
+        response.raise_for_status()
+        payload = response.json()
+
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Erreur Twelve Data: {exc}",
+        )
+
+    if payload.get("status") == "error":
+        raise HTTPException(
+            status_code=502,
+            detail=payload.get(
+                "message",
+                "Erreur Twelve Data",
+            ),
+        )
+
+    values = payload.get("values")
+
+    if not values:
+        raise HTTPException(
+            status_code=502,
+            detail="Twelve Data n'a retourne aucune bougie.",
+        )
+
+    candles: List[Dict[str, float]] = []
+
+    for row in values:
+        try:
+            candles.append(
+                {
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                    "volume": float(
+                        row.get("volume", 0) or 0
+                    ),
+                }
+            )
+
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    if len(candles) < 30:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Nombre de bougies insuffisant: {len(candles)}",
+        )
+
+    return candles[-outputsize:]
 
 
-def clean_number(value):
-    if value is None:
-        return None
+# ============================================================
+# DATAFRAME
+# ============================================================
 
-    if isinstance(value, float):
-        if math.isnan(value) or math.isinf(value):
-            return None
+def to_dataframe(
+    candles: List[Dict[str, float]]
+) -> pd.DataFrame:
 
-    return value
+    df = pd.DataFrame(candles).copy()
+
+    for col in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    ]:
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce",
+        )
+
+    df = (
+        df.dropna(
+            subset=[
+                "open",
+                "high",
+                "low",
+                "close",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+    return df
 
 
-def round_price(value: Optional[float], digits: int = 5):
-    if value is None:
-        return None
+# ============================================================
+# RSI
+# ============================================================
 
-    return round(float(value), digits)
+def rsi(
+    series: pd.Series,
+    period: int = 14,
+) -> pd.Series:
+
+    delta = series.diff()
+
+    gain = delta.clip(lower=0)
+
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(
+        0,
+        np.nan,
+    )
+
+    result = 100 - (
+        100 / (1 + rs)
+    )
+
+    result = result.fillna(50.0)
+
+    return result
+
+
+# ============================================================
+# ATR
+# ============================================================
+
+def atr(
+    df: pd.DataFrame,
+    period: int = 14,
+) -> pd.Series:
+
+    prev_close = df["close"].shift(1)
+
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (
+                df["high"] - prev_close
+            ).abs(),
+            (
+                df["low"] - prev_close
+            ).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    return tr.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
 
 
 # ============================================================
 # INDICATEURS
 # ============================================================
 
-def ema(values: List[float], period: int) -> float:
-    if len(values) < period:
-        raise ValueError(f"Pas assez de données pour EMA{period}")
+def calculate_indicators(
+    df: pd.DataFrame,
+) -> Dict[str, float]:
 
-    multiplier = 2 / (period + 1)
+    close = df["close"]
 
-    result = sum(values[:period]) / period
+    ema9 = close.ewm(
+        span=9,
+        adjust=False,
+    ).mean()
 
-    for price in values[period:]:
-        result = (price - result) * multiplier + result
+    ema21 = close.ewm(
+        span=21,
+        adjust=False,
+    ).mean()
 
-    return result
+    rsi14 = rsi(
+        close,
+        14,
+    )
 
+    atr14 = atr(
+        df,
+        14,
+    )
 
-def calculate_rsi(values: List[float], period: int = 14) -> float:
-    if len(values) < period + 1:
-        raise ValueError("Pas assez de données pour RSI")
+    momentum_5 = (
+        close.iloc[-1]
+        - close.iloc[-6]
+    )
 
-    gains = []
-    losses = []
-
-    for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
-
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
-
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-
-    for i in range(period, len(gains)):
-        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
-        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
-
-    if avg_loss == 0:
-        return 100.0
-
-    rs = avg_gain / avg_loss
-
-    return 100 - (100 / (1 + rs))
-
-
-def calculate_atr(candles: List[Candle], period: int = 14) -> float:
-    if len(candles) < period + 1:
-        raise ValueError("Pas assez de données pour ATR")
-
-    true_ranges = []
-
-    for i in range(1, len(candles)):
-        current = candles[i]
-        previous = candles[i - 1]
-
-        tr = max(
-            current.high - current.low,
-            abs(current.high - previous.close),
-            abs(current.low - previous.close),
-        )
-
-        true_ranges.append(tr)
-
-    return sum(true_ranges[-period:]) / period
-
-
-def calculate_momentum(closes: List[float], period: int = 5) -> float:
-    if len(closes) <= period:
-        return 0.0
-
-    return closes[-1] - closes[-1 - period]
-
-
-def calculate_average_range(
-    candles: List[Candle],
-    period: int = 20
-) -> float:
-
-    if len(candles) < period:
-        period = len(candles)
-
-    ranges = [
-        candle.high - candle.low
-        for candle in candles[-period:]
-    ]
-
-    return sum(ranges) / len(ranges)
-
-
-def calculate_support_resistance(
-    candles: List[Candle],
-    lookback: int = 20
-):
-    recent = candles[-lookback:]
-
-    support = min(c.low for c in recent)
-    resistance = max(c.high for c in recent)
-
-    return support, resistance
+    return {
+        "ema9": float(ema9.iloc[-1]),
+        "ema21": float(ema21.iloc[-1]),
+        "rsi14": float(rsi14.iloc[-1]),
+        "momentum_5": float(momentum_5),
+        "atr14": float(atr14.iloc[-1]),
+    }
 
 
 # ============================================================
-# ANALYSE PRINCIPALE
+# CONTEXTE MARCHE
 # ============================================================
 
-def analyze_candles(
-    candles: List[Candle],
-    asset: str = "EURUSD",
-    timeframe: str = "15m"
-):
+def market_context(
+    df: pd.DataFrame,
+    indicators: Dict[str, float],
+) -> Dict[str, Any]:
 
-    if len(candles) < 30:
-        raise ValueError(
-            "Minimum 30 bougies nécessaires pour l'analyse."
-        )
-
-    # --------------------------------------------------------
-    # DONNEES
-    # --------------------------------------------------------
-
-    closes = [c.close for c in candles]
-
-    current = candles[-1]
-    previous = candles[-2]
-
-    price = current.close
-
-    # --------------------------------------------------------
-    # INDICATEURS
-    # --------------------------------------------------------
-
-    ema9 = ema(closes, 9)
-    ema21 = ema(closes, 21)
-
-    rsi14 = calculate_rsi(closes, 14)
-
-    momentum_5 = calculate_momentum(closes, 5)
-
-    atr14 = calculate_atr(candles, 14)
-
-    average_range = calculate_average_range(
-        candles,
-        20
+    ranges = (
+        df["high"]
+        - df["low"]
     )
 
-    recent_average_range = calculate_average_range(
-        candles,
-        5
+    average_range = float(
+        ranges.tail(50).mean()
     )
 
-    support, resistance = calculate_support_resistance(
-        candles,
-        20
+    recent_average_range = float(
+        ranges.tail(10).mean()
     )
 
-    # --------------------------------------------------------
-    # VOLATILITE
-    # --------------------------------------------------------
+    volatility_ratio = (
+        recent_average_range
+        / average_range
+        if average_range > 0
+        else 1.0
+    )
 
-    if average_range <= 0:
-        volatility_ratio = 0
-    else:
-        volatility_ratio = (
-            recent_average_range / average_range
-        )
+    last = df.iloc[-1]
+
+    direction = (
+        "BULLISH"
+        if last["close"] > last["open"]
+        else "BEARISH"
+        if last["close"] < last["open"]
+        else "NEUTRAL"
+    )
 
     if volatility_ratio < 0.70:
         volatility_state = "LOW"
@@ -301,609 +353,571 @@ def analyze_candles(
     else:
         volatility_state = "NORMAL"
 
-    # --------------------------------------------------------
-    # TENDANCE EMA
-    # --------------------------------------------------------
+    return {
+        "candle_direction": direction,
+        "average_range": average_range,
+        "recent_average_range": recent_average_range,
+        "volatility_ratio": volatility_ratio,
+        "volatility_state": volatility_state,
+    }
 
-    ema_difference = ema9 - ema21
 
-    if ema_difference > atr14 * 0.10:
-        ema_trend = "BULLISH"
+# ============================================================
+# SUPPORT / RESISTANCE
+# ============================================================
 
-    elif ema_difference < -atr14 * 0.10:
-        ema_trend = "BEARISH"
+def levels(
+    df: pd.DataFrame,
+) -> Dict[str, float]:
 
-    else:
-        ema_trend = "NEUTRAL"
+    window = df.tail(50)
 
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
+    return {
+        "support": float(
+            window["low"].min()
+        ),
+        "resistance": float(
+            window["high"].max()
+        ),
+    }
 
-    if rsi14 >= 55:
-        rsi_direction = "BULLISH"
 
-    elif rsi14 <= 45:
-        rsi_direction = "BEARISH"
+# ============================================================
+# MOTEUR DE DECISION
+# 4 BLOCS
+# ============================================================
 
-    else:
-        rsi_direction = "NEUTRAL"
+def decision_engine(
+    df: pd.DataFrame,
+    ind: Dict[str, float],
+    market: Dict[str, Any],
+    lv: Dict[str, float],
+) -> Dict[str, Any]:
 
-    # --------------------------------------------------------
-    # MOMENTUM
-    # --------------------------------------------------------
+    """
+    Four blocs:
+    1. Tendance
+    2. Confirmation
+    3. Signal
+    4. Trade plan
+    """
 
-    momentum_threshold = max(
-        atr14 * 0.10,
-        0.00001
+    close = float(
+        df["close"].iloc[-1]
     )
 
-    if momentum_5 > momentum_threshold:
-        momentum_direction = "BULLISH"
+    ema9 = ind["ema9"]
+    ema21 = ind["ema21"]
 
-    elif momentum_5 < -momentum_threshold:
-        momentum_direction = "BEARISH"
+    rsi14 = ind["rsi14"]
+    momentum = ind["momentum_5"]
+    atr14 = ind["atr14"]
 
-    else:
-        momentum_direction = "NEUTRAL"
+    # ========================================================
+    # BLOC 1 — FILTRE DE TENDANCE
+    # ========================================================
 
-    # --------------------------------------------------------
-    # BOUGIE
-    # --------------------------------------------------------
+    trend_score = 0
 
-    if current.close > current.open:
-        candle_direction = "BULLISH"
+    trend_reasons: List[str] = []
 
-    elif current.close < current.open:
-        candle_direction = "BEARISH"
+    if ema9 > ema21:
 
-    else:
-        candle_direction = "DOJI"
+        trend_score += 1
 
-    # --------------------------------------------------------
-    # SCORE
-    # --------------------------------------------------------
-
-    score = 0
-    reasons = []
-
-    # EMA
-    if ema_trend == "BULLISH":
-        score += 2
-        reasons.append("EMA9 au-dessus de EMA21")
-
-    elif ema_trend == "BEARISH":
-        score -= 2
-        reasons.append("EMA9 sous EMA21")
-
-    else:
-        reasons.append(
-            "EMA9 et EMA21 proches - zone neutre"
+        trend_reasons.append(
+            "EMA9 au-dessus de EMA21"
         )
 
-    # RSI
+    elif ema9 < ema21:
+
+        trend_score -= 1
+
+        trend_reasons.append(
+            "EMA9 sous EMA21"
+        )
+
+    else:
+
+        trend_reasons.append(
+            "EMA9 et EMA21 proches"
+        )
+
+    if close > ema9:
+
+        trend_score += 1
+
+        trend_reasons.append(
+            "Prix au-dessus de EMA9"
+        )
+
+    elif close < ema9:
+
+        trend_score -= 1
+
+        trend_reasons.append(
+            "Prix sous EMA9"
+        )
+
+    trend = (
+        "BULLISH"
+        if trend_score >= 2
+        else "BEARISH"
+        if trend_score <= -2
+        else "NEUTRAL"
+    )
+
+    # ========================================================
+    # BLOC 2 — CONFIRMATION
+    # ========================================================
+
+    confirmation_score = 0
+
+    reasons: List[str] = []
+
     if rsi14 >= 55:
-        score += 1
+
+        confirmation_score += 1
+
         reasons.append(
-            "RSI confirme une pression haussière"
+            "RSI haussier"
         )
 
     elif rsi14 <= 45:
-        score -= 1
+
+        confirmation_score -= 1
+
         reasons.append(
-            "RSI confirme une pression baissière"
+            "RSI baissier"
         )
 
     else:
+
         reasons.append(
             "RSI neutre"
         )
 
-    # Momentum
-    if momentum_direction == "BULLISH":
-        score += 1
-        reasons.append("Momentum positif")
+    if momentum > 0:
 
-    elif momentum_direction == "BEARISH":
-        score -= 1
-        reasons.append("Momentum négatif")
+        confirmation_score += 1
 
-    else:
-        reasons.append("Momentum faible")
+        reasons.append(
+            "Momentum positif"
+        )
 
-    # Bougie
-    if candle_direction == "BULLISH":
-        score += 1
-        reasons.append("Dernière bougie haussière")
+    elif momentum < 0:
 
-    elif candle_direction == "BEARISH":
-        score -= 1
-        reasons.append("Dernière bougie baissière")
+        confirmation_score -= 1
 
-    # --------------------------------------------------------
-    # FILTRE VOLATILITE
-    # --------------------------------------------------------
+        reasons.append(
+            "Momentum négatif"
+        )
 
-    if volatility_state == "LOW":
-        reasons.append("Volatilité faible")
+    if (
+        market["candle_direction"]
+        == "BULLISH"
+    ):
 
-    elif volatility_state == "HIGH":
-        reasons.append("Volatilité élevée")
+        confirmation_score += 1
 
-    else:
-        reasons.append("Volatilité normale")
+        reasons.append(
+            "Dernière bougie haussière"
+        )
 
-    # --------------------------------------------------------
-    # SIGNAL
-    # --------------------------------------------------------
+    elif (
+        market["candle_direction"]
+        == "BEARISH"
+    ):
 
-    if score >= 4:
+        confirmation_score -= 1
+
+        reasons.append(
+            "Dernière bougie baissière"
+        )
+
+    if (
+        market["volatility_state"]
+        == "LOW"
+    ):
+
+        reasons.append(
+            "Volatilité faible"
+        )
+
+    elif (
+        market["volatility_state"]
+        == "HIGH"
+    ):
+
+        reasons.append(
+            "Volatilité élevée"
+        )
+
+    # ========================================================
+    # BLOC 3 — SCORE / SIGNAL
+    # ========================================================
+
+    score = (
+        trend_score
+        + confirmation_score
+    )
+
+    # Une faible volatilité réduit
+    # la conviction mais n'inverse
+    # jamais le signal.
+
+    if (
+        market["volatility_state"]
+        == "LOW"
+        and abs(score) >= 3
+    ):
+
+        score = int(
+            np.sign(score) * 2
+        )
+
+        reasons.append(
+            "Filtre de volatilité: "
+            "conviction réduite"
+        )
+
+    if score >= 3:
+
         signal = "BUY"
 
-    elif score <= -4:
+    elif score <= -3:
+
         signal = "SELL"
 
     else:
+
         signal = "WAIT"
 
-    # --------------------------------------------------------
-    # CONFIDENCE
-    # --------------------------------------------------------
-
-    confidence = 50 + (abs(score) * 8)
-
-    if confidence > 95:
-        confidence = 95
-
-    # Faible volatilité = prudence
-    if volatility_state == "LOW" and signal != "WAIT":
-        confidence -= 10
-
-    confidence = max(
-        50,
-        min(95, confidence)
+    confidence = (
+        50
+        + abs(score) * 8
     )
 
-    # --------------------------------------------------------
-    # TENDANCE FINALE
-    # --------------------------------------------------------
+    if signal == "WAIT":
 
-    if score >= 2:
-        trend = "BULLISH"
+        confidence = (
+            50
+            + min(
+                abs(score) * 8,
+                16,
+            )
+        )
 
-    elif score <= -2:
-        trend = "BEARISH"
+    confidence = int(
+        min(
+            95,
+            max(
+                50,
+                confidence,
+            ),
+        )
+    )
 
-    else:
-        trend = "NEUTRAL"
+    # ========================================================
+    # BLOC 4 — PLAN DE TRADE
+    # ========================================================
 
-    # --------------------------------------------------------
-    # STOP LOSS / TAKE PROFIT
-    # --------------------------------------------------------
+    entry = close
 
-    entry = price
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    risk_reward: Optional[float] = None
+    stop_distance: Optional[float] = None
+    target_distance: Optional[float] = None
 
-    stop_loss = None
-    take_profit = None
-    risk_reward = None
+    recent = df.tail(20)
 
     if signal == "BUY":
 
-        # SL sous le support ou ATR
-        atr_stop = entry - (atr14 * 1.5)
-
-        stop_loss = min(
-            atr_stop,
-            support
+        structural_sl = float(
+            recent["low"].min()
         )
 
-        risk = entry - stop_loss
+        atr_sl = (
+            entry
+            - (1.5 * atr14)
+        )
 
-        if risk > 0:
-            take_profit = entry + (risk * 2.0)
+        stop_loss = min(
+            structural_sl,
+            atr_sl,
+        )
+
+        stop_distance = (
+            entry
+            - stop_loss
+        )
+
+        if stop_distance > 0:
+
+            target_distance = (
+                stop_distance * 2.0
+            )
+
+            take_profit = (
+                entry
+                + target_distance
+            )
+
             risk_reward = 2.0
 
     elif signal == "SELL":
 
-        # SL au-dessus de la résistance ou ATR
-        atr_stop = entry + (atr14 * 1.5)
-
-        stop_loss = max(
-            atr_stop,
-            resistance
+        structural_sl = float(
+            recent["high"].max()
         )
 
-        risk = stop_loss - entry
+        atr_sl = (
+            entry
+            + (1.5 * atr14)
+        )
 
-        if risk > 0:
-            take_profit = entry - (risk * 2.0)
+        stop_loss = max(
+            structural_sl,
+            atr_sl,
+        )
+
+        stop_distance = (
+            stop_loss
+            - entry
+        )
+
+        if stop_distance > 0:
+
+            target_distance = (
+                stop_distance * 2.0
+            )
+
+            take_profit = (
+                entry
+                - target_distance
+            )
+
             risk_reward = 2.0
 
-    # --------------------------------------------------------
-    # DISTANCES
-    # --------------------------------------------------------
+    return {
+        "trend": trend,
+        "score": int(score),
+        "signal": signal,
+        "confidence": confidence,
+        "reasons": (
+            trend_reasons
+            + reasons
+        ),
+        "trade_plan": {
+            "entry": entry,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "risk_reward": risk_reward,
+            "stop_distance": stop_distance,
+            "target_distance": target_distance,
+        },
+    }
 
-    if stop_loss is not None:
-        stop_distance = abs(entry - stop_loss)
-    else:
-        stop_distance = None
 
-    if take_profit is not None:
-        target_distance = abs(take_profit - entry)
-    else:
-        target_distance = None
+# ============================================================
+# ANALYSE
+# ============================================================
 
-    # --------------------------------------------------------
-    # RESULTAT
-    # --------------------------------------------------------
+def analyze_candles(
+    candles: List[Dict[str, float]],
+    asset: str,
+    timeframe: str,
+) -> Dict[str, Any]:
+
+    if len(candles) < 30:
+
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Au moins 30 bougies "
+                "sont necessaires."
+            ),
+        )
+
+    df = to_dataframe(
+        candles
+    )
+
+    if len(df) < 30:
+
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Bougies invalides "
+                "ou insuffisantes."
+            ),
+        )
+
+    ind = calculate_indicators(
+        df
+    )
+
+    market = market_context(
+        df,
+        ind,
+    )
+
+    lv = levels(
+        df
+    )
+
+    decision = decision_engine(
+        df,
+        ind,
+        market,
+        lv,
+    )
 
     return {
         "status": "success",
         "engine_version": APP_VERSION,
-
         "asset": asset,
         "timeframe": timeframe,
-
-        "price": round_price(price),
-
-        "signal": signal,
-        "confidence": confidence,
-        "score": score,
-        "trend": trend,
-
+        "price": float(
+            df["close"].iloc[-1]
+        ),
+        "signal": decision["signal"],
+        "confidence": decision[
+            "confidence"
+        ],
+        "score": decision["score"],
+        "trend": decision["trend"],
         "indicators": {
-            "ema9": round_price(ema9),
-            "ema21": round_price(ema21),
-            "rsi14": round(rsi14, 2),
-            "momentum_5": round(momentum_5, 6),
-            "atr14": round(atr14, 6),
+            k: round(v, 8)
+            for k, v in ind.items()
         },
-
         "market": {
-            "candle_direction": candle_direction,
+            "candle_direction": market[
+                "candle_direction"
+            ],
             "average_range": round(
-                average_range,
-                6
+                market["average_range"],
+                8,
             ),
             "recent_average_range": round(
-                recent_average_range,
-                6
+                market[
+                    "recent_average_range"
+                ],
+                8,
             ),
             "volatility_ratio": round(
-                volatility_ratio,
-                3
+                market[
+                    "volatility_ratio"
+                ],
+                3,
             ),
-            "volatility_state": volatility_state,
+            "volatility_state": market[
+                "volatility_state"
+            ],
         },
-
         "levels": {
-            "support": round_price(support),
-            "resistance": round_price(resistance),
+            k: round(v, 8)
+            for k, v in lv.items()
         },
-
         "trade_plan": {
-            "entry": round_price(entry),
-            "stop_loss": round_price(stop_loss),
-            "take_profit": round_price(take_profit),
-            "risk_reward": risk_reward,
-            "stop_distance": round_price(
-                stop_distance
-            ),
-            "target_distance": round_price(
-                target_distance
-            ),
-        },
-
-        "reasons": reasons,
-
-        "candles_count": len(candles),
-    }
-
-
-# ============================================================
-# TWELVE DATA
-# ============================================================
-
-def get_market_data(
-    asset: str = DEFAULT_SYMBOL,
-    timeframe: str = DEFAULT_TIMEFRAME,
-    outputsize: int = DEFAULT_OUTPUTSIZE
-):
-
-    if not TWELVE_DATA_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "La variable TWELVE_DATA_API_KEY "
-                "n'est pas configurée sur Render."
-            )
-        )
-
-    symbol = normalize_symbol(asset)
-    interval = normalize_interval(timeframe)
-
-    outputsize = max(
-        30,
-        min(outputsize, 5000)
-    )
-
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "apikey": TWELVE_DATA_API_KEY,
-        "format": "JSON",
-    }
-
-    try:
-        response = requests.get(
-            TWELVE_DATA_URL,
-            params=params,
-            timeout=15
-        )
-
-    except requests.RequestException as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Erreur connexion Twelve Data: {exc}"
-        )
-
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"Twelve Data HTTP "
-                f"{response.status_code}"
-            )
-        )
-
-    try:
-        data = response.json()
-
-    except ValueError:
-        raise HTTPException(
-            status_code=502,
-            detail="Réponse Twelve Data invalide."
-        )
-
-    if "status" in data and data["status"] == "error":
-        raise HTTPException(
-            status_code=502,
-            detail=data.get(
-                "message",
-                "Erreur Twelve Data."
-            )
-        )
-
-    values = data.get("values")
-
-    if not values:
-        raise HTTPException(
-            status_code=502,
-            detail="Aucune bougie reçue de Twelve Data."
-        )
-
-    candles = []
-
-    for item in reversed(values):
-
-        try:
-            candles.append(
-                Candle(
-                    open=float(item["open"]),
-                    high=float(item["high"]),
-                    low=float(item["low"]),
-                    close=float(item["close"]),
-                    volume=float(
-                        item.get("volume", 0) or 0
-                    ),
+            k: (
+                None
+                if v is None
+                else round(
+                    float(v),
+                    8,
                 )
             )
-
-        except (KeyError, TypeError, ValueError):
-            continue
-
-    if len(candles) < 30:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Pas assez de bougies valides "
-                f"reçues: {len(candles)}."
+            for k, v in decision[
+                "trade_plan"
+            ].items()
+        },
+        "reasons": decision[
+            "reasons"
+        ],
+        "candles_count": len(df),
+        "candles": (
+            df[
+                [
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                ]
+            ]
+            .round(8)
+            .to_dict(
+                orient="records"
             )
-        )
-
-    return candles
-
-
-# ============================================================
-# POST /analyze
-# ============================================================
-
-@app.post("/analyze")
-def analyze_market(request: AnalyzeRequest):
-
-    try:
-
-        result = analyze_candles(
-            request.candles,
-            request.asset,
-            request.timeframe
-        )
-
-        # Retourner les bougies utilisées
-        result["candles"] = [
-            {
-                "open": c.open,
-                "high": c.high,
-                "low": c.low,
-                "close": c.close,
-            }
-            for c in request.candles
-        ]
-
-        return result
-
-    except ValueError as exc:
-
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc)
-        )
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erreur analyse: {exc}"
-        )
+        ),
+    }
 
 
 # ============================================================
-# GET /market-data
+# ROUTE RACINE
+# ============================================================
+
+@app.get("/")
+def root() -> Dict[str, str]:
+
+    return {
+        "name": "Pocket AI Trader",
+        "version": APP_VERSION,
+        "status": "online",
+        "engine": "4-bloc decision engine",
+    }
+
+
+# ============================================================
+# MARKET DATA
 # ============================================================
 
 @app.get("/market-data")
-def market_data(
-    asset: str = Query(
-        "EURUSD",
-        description="Symbole Forex, ex: EURUSD"
-    ),
-    timeframe: str = Query(
-        "15m",
-        description="Timeframe, ex: 15m"
-    ),
-    outputsize: int = Query(
-        100,
-        ge=30,
-        le=5000,
-        description="Nombre de bougies"
-    )
-):
+def market_data() -> Dict[str, Any]:
 
-    candles = get_market_data(
-        asset,
-        timeframe,
-        outputsize
-    )
+    candles = fetch_candles()
 
     return {
         "status": "success",
         "source": "Twelve Data",
-        "asset": asset.upper(),
-        "timeframe": timeframe,
+        "asset": ASSET,
+        "timeframe": TIMEFRAME,
         "candles_count": len(candles),
-
-        "candles": [
-            {
-                "open": c.open,
-                "high": c.high,
-                "low": c.low,
-                "close": c.close,
-                "volume": c.volume,
-            }
-            for c in candles
-        ],
+        "candles": candles,
     }
 
 
 # ============================================================
-# GET /analyze-live
+# ANALYSE LIVE
 # ============================================================
 
 @app.get("/analyze-live")
-def analyze_live(
-    asset: str = Query(
-        "EURUSD",
-        description="Symbole Forex"
-    ),
-    timeframe: str = Query(
-        "15m",
-        description="Timeframe"
-    ),
-    outputsize: int = Query(
-        100,
-        ge=30,
-        le=5000,
-        description="Nombre de bougies"
-    )
-):
+def analyze_live() -> Dict[str, Any]:
 
-    candles = get_market_data(
-        asset,
-        timeframe,
-        outputsize
+    candles = fetch_candles()
+
+    return analyze_candles(
+        candles,
+        ASSET,
+        TIMEFRAME,
     )
 
-    try:
-
-        result = analyze_candles(
-            candles,
-            asset,
-            timeframe
-        )
-
-        result["candles"] = [
-            {
-                "open": c.open,
-                "high": c.high,
-                "low": c.low,
-                "close": c.close,
-            }
-            for c in candles
-        ]
-
-        return result
-
-    except ValueError as exc:
-
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc)
-        )
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Erreur analyse live: {exc}"
-        )
-
 
 # ============================================================
-# GET /
+# ANALYSE MANUELLE
 # ============================================================
 
-@app.get("/")
-def root():
+@app.post("/analyze")
+def analyze(
+    request: AnalyzeRequest,
+) -> Dict[str, Any]:
 
-    return {
-        "status": "online",
-        "application": "Pocket AI Trader",
-        "version": APP_VERSION,
-        "engine": "Technical Forex Analysis V3",
-        "data_source": "Twelve Data",
-
-        "endpoints": {
-            "analyze": "POST /analyze",
-            "market_data": "GET /market-data",
-            "analyze_live": "GET /analyze-live",
-            "documentation": "/docs",
-        }
-    }
-
-
-# ============================================================
-# LANCEMENT LOCAL
-# ============================================================
-
-if __name__ == "__main__":
-
-    import uvicorn
-
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=int(
-            os.getenv("PORT", "8000")
-        )
+    return analyze_candles(
+        [
+            c.model_dump()
+            for c in request.candles
+        ],
+        request.asset,
+        request.timeframe,
     )
