@@ -1,12 +1,32 @@
-from fastapi import FastAPI, HTTPException
+# ============================================================
+# POCKET AI TRADER - SERVER V3
+# Moteur d'analyse technique Forex
+# FastAPI + Twelve Data
+# ============================================================
+
+import os
+import math
+from typing import List, Optional
+
+import requests
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List
-import os
-import json
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+APP_VERSION = "3.0.0"
+
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
+
+TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
+
+DEFAULT_SYMBOL = "EUR/USD"
+DEFAULT_TIMEFRAME = "15min"
+DEFAULT_OUTPUTSIZE = 100
 
 
 # ============================================================
@@ -16,7 +36,7 @@ from urllib.error import HTTPError, URLError
 app = FastAPI(
     title="Pocket AI Trader",
     description="Moteur d'analyse technique Forex avec données réelles",
-    version="2.4.0"
+    version=APP_VERSION,
 )
 
 app.add_middleware(
@@ -29,935 +49,861 @@ app.add_middleware(
 
 
 # ============================================================
-# CONFIGURATION
-# ============================================================
-
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
-
-TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
-
-DEFAULT_ASSET = "EURUSD"
-DEFAULT_TIMEFRAME = "15m"
-DEFAULT_INTERVAL = "15min"
-DEFAULT_OUTPUTSIZE = 25
-
-
-# ============================================================
 # MODELES
 # ============================================================
 
 class Candle(BaseModel):
-    open: float = Field(..., gt=0)
-    high: float = Field(..., gt=0)
-    low: float = Field(..., gt=0)
-    close: float = Field(..., gt=0)
-    volume: float = Field(default=0, ge=0)
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: Optional[float] = 0
 
 
 class AnalyzeRequest(BaseModel):
     asset: str = "EURUSD"
     timeframe: str = "15m"
-    candles: List[Candle]
+    candles: List[Candle] = Field(..., min_length=30)
 
 
 # ============================================================
-# NORMALISATION SYMBOLE
+# OUTILS
 # ============================================================
 
 def normalize_symbol(asset: str) -> str:
-
+    """
+    EURUSD -> EUR/USD
+    EUR/USD -> EUR/USD
+    """
     asset = asset.upper().strip()
 
-    if asset == "EURUSD":
-        return "EUR/USD"
+    if "/" in asset:
+        return asset
+
+    if len(asset) == 6:
+        return f"{asset[:3]}/{asset[3:]}"
 
     return asset
 
 
-# ============================================================
-# RECUPERATION TWELVE DATA
-# ============================================================
+def normalize_interval(timeframe: str) -> str:
+    """
+    15m -> 15min
+    5m  -> 5min
+    1h  -> 1h
+    """
+    tf = timeframe.lower().strip()
 
-def get_real_candles(
-    asset: str = DEFAULT_ASSET,
-    timeframe: str = DEFAULT_TIMEFRAME,
-    outputsize: int = DEFAULT_OUTPUTSIZE
-) -> List[Candle]:
-
-    if not TWELVE_DATA_API_KEY:
-
-        raise HTTPException(
-            status_code=500,
-            detail="La variable TWELVE_DATA_API_KEY n'est pas configurée sur Render."
-        )
-
-    if timeframe != "15m":
-
-        raise HTTPException(
-            status_code=400,
-            detail="Pour cette étape, seul le timeframe 15m est activé."
-        )
-
-    if outputsize < 25:
-        outputsize = 25
-
-    if outputsize > 5000:
-        outputsize = 5000
-
-    symbol = normalize_symbol(asset)
-
-    params = {
-        "symbol": symbol,
-        "interval": DEFAULT_INTERVAL,
-        "outputsize": outputsize,
-        "apikey": TWELVE_DATA_API_KEY,
-        "timezone": "UTC",
-        "format": "JSON"
+    mapping = {
+        "1m": "1min",
+        "5m": "5min",
+        "15m": "15min",
+        "30m": "30min",
+        "1h": "1h",
+        "4h": "4h",
+        "1d": "1day",
     }
 
-    url = TWELVE_DATA_URL + "?" + urlencode(params)
+    return mapping.get(tf, tf)
 
-    request = Request(
-        url,
-        headers={
-            "User-Agent": "Pocket-AI-Trader/2.4"
-        }
-    )
 
-    try:
+def clean_number(value):
+    if value is None:
+        return None
 
-        with urlopen(request, timeout=15) as response:
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
 
-            raw_data = response.read().decode("utf-8")
+    return value
 
-            data = json.loads(raw_data)
 
-    except HTTPError as exc:
+def round_price(value: Optional[float], digits: int = 5):
+    if value is None:
+        return None
 
-        raise HTTPException(
-            status_code=502,
-            detail=f"Erreur HTTP Twelve Data: {exc.code}"
-        )
-
-    except URLError:
-
-        raise HTTPException(
-            status_code=502,
-            detail="Impossible de joindre Twelve Data."
-        )
-
-    except Exception:
-
-        raise HTTPException(
-            status_code=502,
-            detail="Erreur lors de la récupération des données de marché."
-        )
-
-    # --------------------------------------------------------
-    # ERREUR FOURNISSEUR
-    # --------------------------------------------------------
-
-    if data.get("status") == "error":
-
-        message = data.get(
-            "message",
-            "Erreur inconnue Twelve Data."
-        )
-
-        raise HTTPException(
-            status_code=502,
-            detail=f"Twelve Data: {message}"
-        )
-
-    values = data.get("values")
-
-    if not values:
-
-        raise HTTPException(
-            status_code=502,
-            detail="Twelve Data n'a retourné aucune bougie."
-        )
-
-    candles = []
-
-    for item in values:
-
-        try:
-
-            candle = Candle(
-                open=float(item["open"]),
-                high=float(item["high"]),
-                low=float(item["low"]),
-                close=float(item["close"]),
-                volume=float(item.get("volume", 0) or 0)
-            )
-
-            candles.append(candle)
-
-        except (KeyError, TypeError, ValueError):
-
-            continue
-
-    if len(candles) < 25:
-
-        raise HTTPException(
-            status_code=502,
-            detail=f"Seulement {len(candles)} bougies valides reçues. 25 minimum sont nécessaires."
-        )
-
-    # Twelve Data retourne généralement les plus récentes
-    # en premier. On remet les bougies dans l'ordre chronologique.
-    candles.reverse()
-
-    return candles
+    return round(float(value), digits)
 
 
 # ============================================================
 # INDICATEURS
 # ============================================================
 
-def calculate_ema(values: List[float], period: int) -> float:
-
-    if not values:
-        return 0.0
-
+def ema(values: List[float], period: int) -> float:
     if len(values) < period:
-        return sum(values) / len(values)
+        raise ValueError(f"Pas assez de données pour EMA{period}")
 
     multiplier = 2 / (period + 1)
 
-    ema = sum(values[:period]) / period
+    result = sum(values[:period]) / period
 
     for price in values[period:]:
-        ema = ((price - ema) * multiplier) + ema
+        result = (price - result) * multiplier + result
 
-    return ema
+    return result
 
 
 def calculate_rsi(values: List[float], period: int = 14) -> float:
-
-    if len(values) <= period:
-        return 50.0
+    if len(values) < period + 1:
+        raise ValueError("Pas assez de données pour RSI")
 
     gains = []
     losses = []
 
     for i in range(1, len(values)):
-
         change = values[i] - values[i - 1]
 
-        if change > 0:
-
-            gains.append(change)
-            losses.append(0.0)
-
-        elif change < 0:
-
-            gains.append(0.0)
-            losses.append(abs(change))
-
-        else:
-
-            gains.append(0.0)
-            losses.append(0.0)
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
 
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
     for i in range(period, len(gains)):
-
-        avg_gain = (
-            (avg_gain * (period - 1)) + gains[i]
-        ) / period
-
-        avg_loss = (
-            (avg_loss * (period - 1)) + losses[i]
-        ) / period
+        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
+        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
 
     if avg_loss == 0:
-
-        if avg_gain == 0:
-            return 50.0
-
         return 100.0
 
     rs = avg_gain / avg_loss
 
-    rsi = 100 - (100 / (1 + rs))
-
-    return max(0.0, min(100.0, rsi))
+    return 100 - (100 / (1 + rs))
 
 
-def calculate_momentum(
-    values: List[float],
-    period: int = 5
+def calculate_atr(candles: List[Candle], period: int = 14) -> float:
+    if len(candles) < period + 1:
+        raise ValueError("Pas assez de données pour ATR")
+
+    true_ranges = []
+
+    for i in range(1, len(candles)):
+        current = candles[i]
+        previous = candles[i - 1]
+
+        tr = max(
+            current.high - current.low,
+            abs(current.high - previous.close),
+            abs(current.low - previous.close),
+        )
+
+        true_ranges.append(tr)
+
+    return sum(true_ranges[-period:]) / period
+
+
+def calculate_momentum(closes: List[float], period: int = 5) -> float:
+    if len(closes) <= period:
+        return 0.0
+
+    return closes[-1] - closes[-1 - period]
+
+
+def calculate_average_range(
+    candles: List[Candle],
+    period: int = 20
 ) -> float:
 
-    if len(values) <= period:
-        return 0.0
+    if len(candles) < period:
+        period = len(candles)
 
-    previous = values[-period - 1]
+    ranges = [
+        candle.high - candle.low
+        for candle in candles[-period:]
+    ]
 
-    if previous <= 0:
-        return 0.0
+    return sum(ranges) / len(ranges)
 
-    return ((values[-1] - previous) / previous) * 100
+
+def calculate_support_resistance(
+    candles: List[Candle],
+    lookback: int = 20
+):
+    recent = candles[-lookback:]
+
+    support = min(c.low for c in recent)
+    resistance = max(c.high for c in recent)
+
+    return support, resistance
 
 
 # ============================================================
-# UTILITAIRE
-# ============================================================
-
-def clamp(value: int, minimum: int, maximum: int) -> int:
-
-    return max(minimum, min(maximum, value))
-
-
-# ============================================================
-# MOTEUR D'ANALYSE
+# ANALYSE PRINCIPALE
 # ============================================================
 
 def analyze_candles(
     candles: List[Candle],
-    asset: str,
-    timeframe: str
+    asset: str = "EURUSD",
+    timeframe: str = "15m"
 ):
 
-    if len(candles) < 25:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Au moins 25 bougies sont nécessaires."
+    if len(candles) < 30:
+        raise ValueError(
+            "Minimum 30 bougies nécessaires pour l'analyse."
         )
+
+    # --------------------------------------------------------
+    # DONNEES
+    # --------------------------------------------------------
 
     closes = [c.close for c in candles]
 
-    # ========================================================
+    current = candles[-1]
+    previous = candles[-2]
+
+    price = current.close
+
+    # --------------------------------------------------------
     # INDICATEURS
-    # ========================================================
+    # --------------------------------------------------------
 
-    ema9 = calculate_ema(closes, 9)
-
-    ema21 = calculate_ema(closes, 21)
+    ema9 = ema(closes, 9)
+    ema21 = ema(closes, 21)
 
     rsi14 = calculate_rsi(closes, 14)
 
-    momentum5 = calculate_momentum(closes, 5)
+    momentum_5 = calculate_momentum(closes, 5)
 
-    last_candle = candles[-1]
+    atr14 = calculate_atr(candles, 14)
 
-    # ========================================================
-    # DIRECTION DERNIERE BOUGIE
-    # ========================================================
-
-    if last_candle.close > last_candle.open:
-
-        candle_direction = "BULLISH"
-
-    elif last_candle.close < last_candle.open:
-
-        candle_direction = "BEARISH"
-
-    else:
-
-        candle_direction = "NEUTRAL"
-
-    # ========================================================
-    # RANGE MOYEN
-    # ========================================================
-
-    ranges = [
-        max(0.0, candle.high - candle.low)
-        for candle in candles
-    ]
-
-    average_range = sum(ranges) / len(ranges)
-
-    recent_ranges = ranges[-5:]
-
-    recent_average_range = (
-        sum(recent_ranges) / len(recent_ranges)
+    average_range = calculate_average_range(
+        candles,
+        20
     )
 
-    # ========================================================
-    # SCORE
-    # ========================================================
+    recent_average_range = calculate_average_range(
+        candles,
+        5
+    )
 
-    score = 0
+    support, resistance = calculate_support_resistance(
+        candles,
+        20
+    )
 
-    reasons = []
+    # --------------------------------------------------------
+    # VOLATILITE
+    # --------------------------------------------------------
 
-    # ========================================================
-    # 1. EMA9 / EMA21
-    # ========================================================
-
-    EMA_SEPARATION_THRESHOLD = 0.0005
-
-    ema_difference = abs(ema9 - ema21)
-
-    ema_threshold = closes[-1] * EMA_SEPARATION_THRESHOLD
-
-    if ema_difference <= ema_threshold:
-
-        ema_signal = 0
-
-        ema_state = "NEUTRAL"
-
-        reasons.append(
-            "EMA9 et EMA21 proches - zone neutre"
-        )
-
-    elif ema9 > ema21:
-
-        ema_signal = 2
-
-        ema_state = "BULLISH"
-
-        score += 2
-
-        reasons.append(
-            "EMA9 au-dessus EMA21"
-        )
-
+    if average_range <= 0:
+        volatility_ratio = 0
     else:
-
-        ema_signal = -2
-
-        ema_state = "BEARISH"
-
-        score -= 2
-
-        reasons.append(
-            "EMA9 sous EMA21"
-        )
-
-    # ========================================================
-    # 2. RSI
-    # ========================================================
-
-    rsi_signal = 0
-
-    if 55 <= rsi14 < 70:
-
-        rsi_signal = 1
-
-        score += 1
-
-        reasons.append(
-            "RSI confirme une pression haussière"
-        )
-
-    elif 30 < rsi14 <= 45:
-
-        rsi_signal = -1
-
-        score -= 1
-
-        reasons.append(
-            "RSI confirme une pression baissière"
-        )
-
-    elif rsi14 >= 70:
-
-        reasons.append(
-            "RSI en surachat - risque de correction"
-        )
-
-    elif rsi14 <= 30:
-
-        reasons.append(
-            "RSI en survente - risque de rebond"
-        )
-
-    else:
-
-        reasons.append(
-            "RSI neutre"
-        )
-
-    # ========================================================
-    # 3. MOMENTUM
-    # ========================================================
-
-    momentum_signal = 0
-
-    if abs(momentum5) < 0.03:
-
-        momentum_signal = 0
-
-        reasons.append(
-            "Momentum faible"
-        )
-
-    elif 0.03 <= momentum5 < 0.15:
-
-        momentum_signal = 1
-
-        score += 1
-
-        reasons.append(
-            "Momentum haussier modéré"
-        )
-
-    elif -0.15 < momentum5 <= -0.03:
-
-        momentum_signal = -1
-
-        score -= 1
-
-        reasons.append(
-            "Momentum baissier modéré"
-        )
-
-    elif momentum5 >= 0.15:
-
-        momentum_signal = 2
-
-        score += 2
-
-        reasons.append(
-            "Momentum haussier fort"
-        )
-
-    elif momentum5 <= -0.15:
-
-        momentum_signal = -2
-
-        score -= 2
-
-        reasons.append(
-            "Momentum baissier fort"
-        )
-
-    # ========================================================
-    # 4. DERNIERE BOUGIE
-    # ========================================================
-
-    candle_signal = 0
-
-    if candle_direction == "BULLISH":
-
-        candle_signal = 1
-
-        score += 1
-
-        reasons.append(
-            "Dernière bougie haussière"
-        )
-
-    elif candle_direction == "BEARISH":
-
-        candle_signal = -1
-
-        score -= 1
-
-        reasons.append(
-            "Dernière bougie baissière"
-        )
-
-    else:
-
-        reasons.append(
-            "Dernière bougie neutre"
-        )
-
-    # ========================================================
-    # 5. VOLATILITE
-    # ========================================================
-
-    volatility_ratio = 0.0
-
-    if average_range > 0:
-
         volatility_ratio = (
             recent_average_range / average_range
         )
 
-    range_ratio = 0.0
-
-    if closes[-1] > 0:
-
-        range_ratio = (
-            average_range / closes[-1]
-        )
-
-    if average_range == 0:
-
-        volatility_state = "VERY_LOW"
-
-    elif range_ratio < 0.00015:
-
-        volatility_state = "VERY_LOW"
-
-    elif range_ratio < 0.00050:
-
+    if volatility_ratio < 0.70:
         volatility_state = "LOW"
 
-    elif range_ratio > 0.015:
-
-        volatility_state = "HIGH"
-
-    elif range_ratio > 0.003:
-
-        volatility_state = "HIGH"
-
-    elif volatility_ratio > 1.80:
-
+    elif volatility_ratio > 1.30:
         volatility_state = "HIGH"
 
     else:
-
         volatility_state = "NORMAL"
 
-    # ========================================================
-    # RAISON VOLATILITE
-    # ========================================================
+    # --------------------------------------------------------
+    # TENDANCE EMA
+    # --------------------------------------------------------
 
-    if volatility_state == "VERY_LOW":
+    ema_difference = ema9 - ema21
 
+    if ema_difference > atr14 * 0.10:
+        ema_trend = "BULLISH"
+
+    elif ema_difference < -atr14 * 0.10:
+        ema_trend = "BEARISH"
+
+    else:
+        ema_trend = "NEUTRAL"
+
+    # --------------------------------------------------------
+    # RSI
+    # --------------------------------------------------------
+
+    if rsi14 >= 55:
+        rsi_direction = "BULLISH"
+
+    elif rsi14 <= 45:
+        rsi_direction = "BEARISH"
+
+    else:
+        rsi_direction = "NEUTRAL"
+
+    # --------------------------------------------------------
+    # MOMENTUM
+    # --------------------------------------------------------
+
+    momentum_threshold = max(
+        atr14 * 0.10,
+        0.00001
+    )
+
+    if momentum_5 > momentum_threshold:
+        momentum_direction = "BULLISH"
+
+    elif momentum_5 < -momentum_threshold:
+        momentum_direction = "BEARISH"
+
+    else:
+        momentum_direction = "NEUTRAL"
+
+    # --------------------------------------------------------
+    # BOUGIE
+    # --------------------------------------------------------
+
+    if current.close > current.open:
+        candle_direction = "BULLISH"
+
+    elif current.close < current.open:
+        candle_direction = "BEARISH"
+
+    else:
+        candle_direction = "DOJI"
+
+    # --------------------------------------------------------
+    # SCORE
+    # --------------------------------------------------------
+
+    score = 0
+    reasons = []
+
+    # EMA
+    if ema_trend == "BULLISH":
+        score += 2
+        reasons.append("EMA9 au-dessus de EMA21")
+
+    elif ema_trend == "BEARISH":
+        score -= 2
+        reasons.append("EMA9 sous EMA21")
+
+    else:
         reasons.append(
-            "Volatilité très faible"
+            "EMA9 et EMA21 proches - zone neutre"
         )
 
-    elif volatility_state == "LOW":
-
+    # RSI
+    if rsi14 >= 55:
+        score += 1
         reasons.append(
-            "Volatilité faible"
+            "RSI confirme une pression haussière"
         )
+
+    elif rsi14 <= 45:
+        score -= 1
+        reasons.append(
+            "RSI confirme une pression baissière"
+        )
+
+    else:
+        reasons.append(
+            "RSI neutre"
+        )
+
+    # Momentum
+    if momentum_direction == "BULLISH":
+        score += 1
+        reasons.append("Momentum positif")
+
+    elif momentum_direction == "BEARISH":
+        score -= 1
+        reasons.append("Momentum négatif")
+
+    else:
+        reasons.append("Momentum faible")
+
+    # Bougie
+    if candle_direction == "BULLISH":
+        score += 1
+        reasons.append("Dernière bougie haussière")
+
+    elif candle_direction == "BEARISH":
+        score -= 1
+        reasons.append("Dernière bougie baissière")
+
+    # --------------------------------------------------------
+    # FILTRE VOLATILITE
+    # --------------------------------------------------------
+
+    if volatility_state == "LOW":
+        reasons.append("Volatilité faible")
 
     elif volatility_state == "HIGH":
-
-        reasons.append(
-            "Volatilité élevée"
-        )
+        reasons.append("Volatilité élevée")
 
     else:
+        reasons.append("Volatilité normale")
 
-        reasons.append(
-            "Volatilité normale"
-        )
-
-    # ========================================================
-    # NORMALISATION SCORE
-    # ========================================================
-
-    score = clamp(score, -5, 5)
-
-    # ========================================================
-    # TENDANCE
-    # ========================================================
-
-    if ema_state == "BULLISH":
-
-        trend = "BULLISH"
-
-    elif ema_state == "BEARISH":
-
-        trend = "BEARISH"
-
-    else:
-
-        if score >= 3:
-
-            trend = "BULLISH"
-
-        elif score <= -3:
-
-            trend = "BEARISH"
-
-        else:
-
-            trend = "NEUTRAL"
-
-    # ========================================================
-    # FILTRE CONTRADICTION
-    # ========================================================
-
-    strong_contradiction = False
-
-    if ema_state == "BULLISH" and momentum_signal <= -2:
-
-        strong_contradiction = True
-
-        reasons.append(
-            "Contradiction forte entre tendance EMA et momentum"
-        )
-
-    elif ema_state == "BEARISH" and momentum_signal >= 2:
-
-        strong_contradiction = True
-
-        reasons.append(
-            "Contradiction forte entre tendance EMA et momentum"
-        )
-
-    # ========================================================
+    # --------------------------------------------------------
     # SIGNAL
-    # ========================================================
+    # --------------------------------------------------------
 
-    if strong_contradiction:
-
-        signal = "WAIT"
-
-    elif score >= 3:
-
+    if score >= 4:
         signal = "BUY"
 
-    elif score <= -3:
-
+    elif score <= -4:
         signal = "SELL"
 
     else:
-
         signal = "WAIT"
 
-    # ========================================================
-    # FILTRE RSI EXTREME
-    # ========================================================
+    # --------------------------------------------------------
+    # CONFIDENCE
+    # --------------------------------------------------------
 
-    if signal == "BUY" and rsi14 >= 75:
+    confidence = 50 + (abs(score) * 8)
 
-        reasons.append(
-            "BUY limité par RSI fortement suracheté"
-        )
+    if confidence > 95:
+        confidence = 95
 
-        signal = "WAIT"
+    # Faible volatilité = prudence
+    if volatility_state == "LOW" and signal != "WAIT":
+        confidence -= 10
 
-    elif signal == "SELL" and rsi14 <= 25:
+    confidence = max(
+        50,
+        min(95, confidence)
+    )
 
-        reasons.append(
-            "SELL limité par RSI fortement survendu"
-        )
+    # --------------------------------------------------------
+    # TENDANCE FINALE
+    # --------------------------------------------------------
 
-        signal = "WAIT"
+    if score >= 2:
+        trend = "BULLISH"
 
-    # ========================================================
-    # FILTRE VOLATILITE EXTREMEMENT FAIBLE
-    # ========================================================
-
-    if signal in ("BUY", "SELL"):
-
-        if average_range > 0:
-
-            MIN_RANGE_RATIO = 0.00015
-
-            range_ratio = average_range / closes[-1]
-
-            if range_ratio < MIN_RANGE_RATIO:
-
-                reasons.append(
-                    "Volatilité trop faible pour un signal fort"
-                )
-
-                signal = "WAIT"
-
-    # ========================================================
-    # CONFIANCE
-    # ========================================================
-
-    if signal == "WAIT":
-
-        confidence = 50
+    elif score <= -2:
+        trend = "BEARISH"
 
     else:
+        trend = "NEUTRAL"
 
-        confidence = 50 + (abs(score) * 8)
+    # --------------------------------------------------------
+    # STOP LOSS / TAKE PROFIT
+    # --------------------------------------------------------
 
-        if volatility_state == "HIGH":
+    entry = price
 
-            confidence -= 10
+    stop_loss = None
+    take_profit = None
+    risk_reward = None
 
-        if rsi14 >= 70 or rsi14 <= 30:
+    if signal == "BUY":
 
-            confidence -= 5
+        # SL sous le support ou ATR
+        atr_stop = entry - (atr14 * 1.5)
 
-        confidence = max(
-            50,
-            min(confidence, 90)
+        stop_loss = min(
+            atr_stop,
+            support
         )
 
-    # ========================================================
-    # REPONSE
-    # ========================================================
+        risk = entry - stop_loss
+
+        if risk > 0:
+            take_profit = entry + (risk * 2.0)
+            risk_reward = 2.0
+
+    elif signal == "SELL":
+
+        # SL au-dessus de la résistance ou ATR
+        atr_stop = entry + (atr14 * 1.5)
+
+        stop_loss = max(
+            atr_stop,
+            resistance
+        )
+
+        risk = stop_loss - entry
+
+        if risk > 0:
+            take_profit = entry - (risk * 2.0)
+            risk_reward = 2.0
+
+    # --------------------------------------------------------
+    # DISTANCES
+    # --------------------------------------------------------
+
+    if stop_loss is not None:
+        stop_distance = abs(entry - stop_loss)
+    else:
+        stop_distance = None
+
+    if take_profit is not None:
+        target_distance = abs(take_profit - entry)
+    else:
+        target_distance = None
+
+    # --------------------------------------------------------
+    # RESULTAT
+    # --------------------------------------------------------
 
     return {
-
         "status": "success",
+        "engine_version": APP_VERSION,
 
         "asset": asset,
-
         "timeframe": timeframe,
 
-        "price": closes[-1],
+        "price": round_price(price),
 
         "signal": signal,
-
         "confidence": confidence,
-
         "score": score,
-
         "trend": trend,
 
         "indicators": {
-
-            "ema9": round(ema9, 6),
-
-            "ema21": round(ema21, 6),
-
-            "rsi14": round(rsi14, 6),
-
-            "momentum_5": round(momentum5, 6)
-
+            "ema9": round_price(ema9),
+            "ema21": round_price(ema21),
+            "rsi14": round(rsi14, 2),
+            "momentum_5": round(momentum_5, 6),
+            "atr14": round(atr14, 6),
         },
 
         "market": {
-
             "candle_direction": candle_direction,
-
             "average_range": round(
                 average_range,
                 6
             ),
-
             "recent_average_range": round(
                 recent_average_range,
                 6
             ),
+            "volatility_ratio": round(
+                volatility_ratio,
+                3
+            ),
+            "volatility_state": volatility_state,
+        },
 
-            "volatility_state": volatility_state
+        "levels": {
+            "support": round_price(support),
+            "resistance": round_price(resistance),
+        },
 
+        "trade_plan": {
+            "entry": round_price(entry),
+            "stop_loss": round_price(stop_loss),
+            "take_profit": round_price(take_profit),
+            "risk_reward": risk_reward,
+            "stop_distance": round_price(
+                stop_distance
+            ),
+            "target_distance": round_price(
+                target_distance
+            ),
         },
 
         "reasons": reasons,
 
         "candles_count": len(candles),
-
-        "candles": [
-
-            {
-
-                "open": c.open,
-
-                "high": c.high,
-
-                "low": c.low,
-
-                "close": c.close
-
-            }
-
-            for c in candles
-
-        ]
-
     }
 
 
 # ============================================================
-# ANALYSE MANUELLE
+# TWELVE DATA
+# ============================================================
+
+def get_market_data(
+    asset: str = DEFAULT_SYMBOL,
+    timeframe: str = DEFAULT_TIMEFRAME,
+    outputsize: int = DEFAULT_OUTPUTSIZE
+):
+
+    if not TWELVE_DATA_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "La variable TWELVE_DATA_API_KEY "
+                "n'est pas configurée sur Render."
+            )
+        )
+
+    symbol = normalize_symbol(asset)
+    interval = normalize_interval(timeframe)
+
+    outputsize = max(
+        30,
+        min(outputsize, 5000)
+    )
+
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVE_DATA_API_KEY,
+        "format": "JSON",
+    }
+
+    try:
+        response = requests.get(
+            TWELVE_DATA_URL,
+            params=params,
+            timeout=15
+        )
+
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Erreur connexion Twelve Data: {exc}"
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Twelve Data HTTP "
+                f"{response.status_code}"
+            )
+        )
+
+    try:
+        data = response.json()
+
+    except ValueError:
+        raise HTTPException(
+            status_code=502,
+            detail="Réponse Twelve Data invalide."
+        )
+
+    if "status" in data and data["status"] == "error":
+        raise HTTPException(
+            status_code=502,
+            detail=data.get(
+                "message",
+                "Erreur Twelve Data."
+            )
+        )
+
+    values = data.get("values")
+
+    if not values:
+        raise HTTPException(
+            status_code=502,
+            detail="Aucune bougie reçue de Twelve Data."
+        )
+
+    candles = []
+
+    for item in reversed(values):
+
+        try:
+            candles.append(
+                Candle(
+                    open=float(item["open"]),
+                    high=float(item["high"]),
+                    low=float(item["low"]),
+                    close=float(item["close"]),
+                    volume=float(
+                        item.get("volume", 0) or 0
+                    ),
+                )
+            )
+
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    if len(candles) < 30:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Pas assez de bougies valides "
+                f"reçues: {len(candles)}."
+            )
+        )
+
+    return candles
+
+
+# ============================================================
+# POST /analyze
 # ============================================================
 
 @app.post("/analyze")
-def analyze_market(data: AnalyzeRequest):
+def analyze_market(request: AnalyzeRequest):
 
-    return analyze_candles(
-        candles=data.candles,
-        asset=data.asset,
-        timeframe=data.timeframe
-    )
+    try:
+
+        result = analyze_candles(
+            request.candles,
+            request.asset,
+            request.timeframe
+        )
+
+        # Retourner les bougies utilisées
+        result["candles"] = [
+            {
+                "open": c.open,
+                "high": c.high,
+                "low": c.low,
+                "close": c.close,
+            }
+            for c in request.candles
+        ]
+
+        return result
+
+    except ValueError as exc:
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc)
+        )
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur analyse: {exc}"
+        )
 
 
 # ============================================================
-# DONNEES REELLES
+# GET /market-data
 # ============================================================
 
 @app.get("/market-data")
-def market_data():
+def market_data(
+    asset: str = Query(
+        "EURUSD",
+        description="Symbole Forex, ex: EURUSD"
+    ),
+    timeframe: str = Query(
+        "15m",
+        description="Timeframe, ex: 15m"
+    ),
+    outputsize: int = Query(
+        100,
+        ge=30,
+        le=5000,
+        description="Nombre de bougies"
+    )
+):
 
-    candles = get_real_candles(
-        asset=DEFAULT_ASSET,
-        timeframe=DEFAULT_TIMEFRAME,
-        outputsize=25
+    candles = get_market_data(
+        asset,
+        timeframe,
+        outputsize
     )
 
     return {
-
         "status": "success",
-
         "source": "Twelve Data",
-
-        "asset": DEFAULT_ASSET,
-
-        "timeframe": DEFAULT_TIMEFRAME,
-
+        "asset": asset.upper(),
+        "timeframe": timeframe,
         "candles_count": len(candles),
 
         "candles": [
-
             {
-
                 "open": c.open,
-
                 "high": c.high,
-
                 "low": c.low,
-
                 "close": c.close,
-
-                "volume": c.volume
-
+                "volume": c.volume,
             }
-
             for c in candles
-
-        ]
-
+        ],
     }
 
 
 # ============================================================
-# ANALYSE REELLE
+# GET /analyze-live
 # ============================================================
 
 @app.get("/analyze-live")
-def analyze_live():
+def analyze_live(
+    asset: str = Query(
+        "EURUSD",
+        description="Symbole Forex"
+    ),
+    timeframe: str = Query(
+        "15m",
+        description="Timeframe"
+    ),
+    outputsize: int = Query(
+        100,
+        ge=30,
+        le=5000,
+        description="Nombre de bougies"
+    )
+):
 
-    candles = get_real_candles(
-        asset=DEFAULT_ASSET,
-        timeframe=DEFAULT_TIMEFRAME,
-        outputsize=25
+    candles = get_market_data(
+        asset,
+        timeframe,
+        outputsize
     )
 
-    return analyze_candles(
-        candles=candles,
-        asset=DEFAULT_ASSET,
-        timeframe=DEFAULT_TIMEFRAME
-    )
+    try:
+
+        result = analyze_candles(
+            candles,
+            asset,
+            timeframe
+        )
+
+        result["candles"] = [
+            {
+                "open": c.open,
+                "high": c.high,
+                "low": c.low,
+                "close": c.close,
+            }
+            for c in candles
+        ]
+
+        return result
+
+    except ValueError as exc:
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc)
+        )
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur analyse live: {exc}"
+        )
 
 
 # ============================================================
-# ROOT
+# GET /
 # ============================================================
 
 @app.get("/")
 def root():
 
     return {
-
         "status": "online",
-
-        "service": "Pocket AI Trader",
-
-        "version": "2.4.0",
+        "application": "Pocket AI Trader",
+        "version": APP_VERSION,
+        "engine": "Technical Forex Analysis V3",
+        "data_source": "Twelve Data",
 
         "endpoints": {
-
-            "manual_analysis": "/analyze",
-
-            "real_market_data": "/market-data",
-
-            "live_analysis": "/analyze-live"
-
+            "analyze": "POST /analyze",
+            "market_data": "GET /market-data",
+            "analyze_live": "GET /analyze-live",
+            "documentation": "/docs",
         }
-
     }
+
+
+# ============================================================
+# LANCEMENT LOCAL
+# ============================================================
+
+if __name__ == "__main__":
+
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(
+            os.getenv("PORT", "8000")
+        )
+    )
