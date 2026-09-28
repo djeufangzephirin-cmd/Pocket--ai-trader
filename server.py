@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================
 
-APP_VERSION = "4.0.1"
+APP_VERSION = "4.1.0"
 
 # Format interne du moteur
 ASSET = "EURUSD"
@@ -24,6 +24,16 @@ TWELVE_DATA_SYMBOL = "EUR/USD"
 TWELVE_DATA_INTERVAL = "15min"
 
 CANDLE_LIMIT = 100
+
+# Paramètres moteur 4.1
+LOW_VOLATILITY_THRESHOLD = 0.70
+HIGH_VOLATILITY_THRESHOLD = 1.30
+
+# Distance minimale d'un niveau opposé exprimée en ATR
+LEVEL_BUFFER_ATR = 0.50
+
+# Ratio risque/rendement minimal accepté
+MIN_RR = 1.50
 
 
 # ============================================================
@@ -431,11 +441,17 @@ def market_context(
         else "NEUTRAL"
     )
 
-    if volatility_ratio < 0.70:
+    if (
+        volatility_ratio
+        < LOW_VOLATILITY_THRESHOLD
+    ):
 
         volatility_state = "LOW"
 
-    elif volatility_ratio > 1.30:
+    elif (
+        volatility_ratio
+        > HIGH_VOLATILITY_THRESHOLD
+    ):
 
         volatility_state = "HIGH"
 
@@ -473,99 +489,99 @@ def levels(
 
 
 # ============================================================
-# MOTEUR DE DECISION
-# 4 BLOCS
+# BLOC 1 — FILTRE SUPPORT / RESISTANCE
 # ============================================================
 
-def decision_engine(
-    df: pd.DataFrame,
-    ind: Dict[str, float],
-    market: Dict[str, Any],
+def level_context(
+    close: float,
+    atr14: float,
     lv: Dict[str, float],
 ) -> Dict[str, Any]:
 
-    """
-    Four blocs:
+    support = lv["support"]
+    resistance = lv["resistance"]
 
-    1. Tendance
-    2. Confirmation
-    3. Signal
-    4. Trade plan
-    """
-
-    close = float(
-        df["close"].iloc[-1]
+    distance_to_support = max(
+        0.0,
+        close - support,
     )
 
-    ema9 = ind["ema9"]
-    ema21 = ind["ema21"]
+    distance_to_resistance = max(
+        0.0,
+        resistance - close,
+    )
 
-    rsi14 = ind["rsi14"]
-    momentum = ind["momentum_5"]
-    atr14 = ind["atr14"]
+    if atr14 > 0:
 
-    # ========================================================
-    # BLOC 1 — FILTRE DE TENDANCE
-    # ========================================================
-
-    trend_score = 0
-
-    trend_reasons: List[str] = []
-
-    if ema9 > ema21:
-
-        trend_score += 1
-
-        trend_reasons.append(
-            "EMA9 au-dessus de EMA21"
+        support_atr = (
+            distance_to_support
+            / atr14
         )
 
-    elif ema9 < ema21:
-
-        trend_score -= 1
-
-        trend_reasons.append(
-            "EMA9 sous EMA21"
+        resistance_atr = (
+            distance_to_resistance
+            / atr14
         )
 
     else:
 
-        trend_reasons.append(
-            "EMA9 et EMA21 proches"
-        )
+        support_atr = 0.0
+        resistance_atr = 0.0
 
-    if close > ema9:
-
-        trend_score += 1
-
-        trend_reasons.append(
-            "Prix au-dessus de EMA9"
-        )
-
-    elif close < ema9:
-
-        trend_score -= 1
-
-        trend_reasons.append(
-            "Prix sous EMA9"
-        )
-
-    trend = (
-        "BULLISH"
-        if trend_score >= 2
-        else "BEARISH"
-        if trend_score <= -2
-        else "NEUTRAL"
+    # BUY dangereux si résistance trop proche
+    buy_blocked = (
+        atr14 > 0
+        and distance_to_resistance
+        <= LEVEL_BUFFER_ATR * atr14
     )
 
-    # ========================================================
-    # BLOC 2 — CONFIRMATION
-    # ========================================================
+    # SELL dangereux si support trop proche
+    sell_blocked = (
+        atr14 > 0
+        and distance_to_support
+        <= LEVEL_BUFFER_ATR * atr14
+    )
+
+    if buy_blocked:
+
+        level_bias = "RESISTANCE_NEAR"
+
+    elif sell_blocked:
+
+        level_bias = "SUPPORT_NEAR"
+
+    else:
+
+        level_bias = "ROOM_AVAILABLE"
+
+    return {
+        "distance_to_support": distance_to_support,
+        "distance_to_resistance": distance_to_resistance,
+        "support_atr": support_atr,
+        "resistance_atr": resistance_atr,
+        "buy_blocked": buy_blocked,
+        "sell_blocked": sell_blocked,
+        "level_bias": level_bias,
+    }
+
+
+# ============================================================
+# BLOC 2 — CONFIRMATION RENFORCEE
+# ============================================================
+
+def confirmation_block(
+    df: pd.DataFrame,
+    ind: Dict[str, float],
+    market: Dict[str, Any],
+) -> Dict[str, Any]:
+
+    rsi14 = ind["rsi14"]
+    momentum = ind["momentum_5"]
 
     confirmation_score = 0
-
     reasons: List[str] = []
 
+    # RSI
     if rsi14 >= 55:
 
         confirmation_score += 1
@@ -588,6 +604,7 @@ def decision_engine(
             "RSI neutre"
         )
 
+    # Momentum
     if momentum > 0:
 
         confirmation_score += 1
@@ -601,9 +618,16 @@ def decision_engine(
         confirmation_score -= 1
 
         reasons.append(
-            "Momentum négatif"
+            "Momentum negatif"
         )
 
+    else:
+
+        reasons.append(
+            "Momentum neutre"
+        )
+
+    # Dernière bougie
     if (
         market["candle_direction"]
         == "BULLISH"
@@ -626,36 +650,568 @@ def decision_engine(
             "Dernière bougie baissière"
         )
 
-    if (
-        market["volatility_state"]
-        == "LOW"
-    ):
+    else:
 
         reasons.append(
-            "Volatilité faible"
+            "Dernière bougie neutre"
         )
+
+    return {
+        "score": int(
+            confirmation_score
+        ),
+        "reasons": reasons,
+    }
+
+
+# ============================================================
+# BLOC 3 — QUALITE DU SETUP
+# ============================================================
+
+def calculate_setup_quality(
+    signal: str,
+    trend_score: int,
+    confirmation_score: int,
+    ind: Dict[str, float],
+    market: Dict[str, Any],
+    level_ctx: Dict[str, Any],
+) -> Dict[str, Any]:
+
+    # Base
+    if signal == "WAIT":
+
+        quality = 35
+
+    else:
+
+        quality = 50
+
+    # --------------------------------------------------------
+    # Force de tendance
+    # --------------------------------------------------------
+
+    if abs(trend_score) == 2:
+
+        quality += 15
+
+    elif abs(trend_score) == 1:
+
+        quality += 7
+
+    # --------------------------------------------------------
+    # Confirmation
+    # --------------------------------------------------------
+
+    if abs(confirmation_score) == 3:
+
+        quality += 20
+
+    elif abs(confirmation_score) == 2:
+
+        quality += 12
+
+    elif abs(confirmation_score) == 1:
+
+        quality += 5
+
+    # --------------------------------------------------------
+    # Cohérence signal / confirmation
+    # --------------------------------------------------------
+
+    if signal == "BUY":
+
+        if confirmation_score >= 2:
+
+            quality += 10
+
+        elif confirmation_score <= -1:
+
+            quality -= 15
+
+    elif signal == "SELL":
+
+        if confirmation_score <= -2:
+
+            quality += 10
+
+        elif confirmation_score >= 1:
+
+            quality -= 15
+
+    # --------------------------------------------------------
+    # Volatilité
+    # --------------------------------------------------------
+
+    if (
+        market["volatility_state"]
+        == "NORMAL"
+    ):
+
+        quality += 5
 
     elif (
         market["volatility_state"]
         == "HIGH"
     ):
 
-        reasons.append(
-            "Volatilité élevée"
+        quality += 2
+
+    elif (
+        market["volatility_state"]
+        == "LOW"
+    ):
+
+        quality -= 8
+
+    # --------------------------------------------------------
+    # Espace devant le trade
+    # --------------------------------------------------------
+
+    if signal == "BUY":
+
+        room_atr = (
+            level_ctx["resistance_atr"]
         )
 
+    elif signal == "SELL":
+
+        room_atr = (
+            level_ctx["support_atr"]
+        )
+
+    else:
+
+        room_atr = 0.0
+
+    if room_atr >= 2.0:
+
+        quality += 8
+
+    elif room_atr >= 1.0:
+
+        quality += 4
+
+    elif (
+        room_atr < 0.5
+        and signal != "WAIT"
+    ):
+
+        quality -= 15
+
+    # --------------------------------------------------------
+    # Blocage S/R
+    # --------------------------------------------------------
+
+    if (
+        signal == "BUY"
+        and level_ctx["buy_blocked"]
+    ):
+
+        quality -= 20
+
+    if (
+        signal == "SELL"
+        and level_ctx["sell_blocked"]
+    ):
+
+        quality -= 20
+
+    # Limites
+    quality = int(
+        max(
+            0,
+            min(
+                100,
+                quality,
+            ),
+        )
+    )
+
+    if quality >= 75:
+
+        state = "STRONG"
+
+    elif quality >= 55:
+
+        state = "MODERATE"
+
+    else:
+
+        state = "WEAK"
+
+    return {
+        "score": quality,
+        "state": state,
+    }
+
+
+# ============================================================
+# BLOC 4 — PLAN DE TRADE DYNAMIQUE
+# ============================================================
+
+def calculate_trade_plan(
+    df: pd.DataFrame,
+    signal: str,
+    atr14: float,
+    lv: Dict[str, float],
+) -> Dict[str, Optional[float]]:
+
+    entry = float(
+        df["close"].iloc[-1]
+    )
+
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    risk_reward: Optional[float] = None
+    stop_distance: Optional[float] = None
+    target_distance: Optional[float] = None
+
+    if atr14 <= 0:
+
+        return {
+            "entry": entry,
+            "stop_loss": None,
+            "take_profit": None,
+            "risk_reward": None,
+            "stop_distance": None,
+            "target_distance": None,
+        }
+
+    recent = df.tail(20)
+
     # ========================================================
-    # BLOC 3 — SCORE / SIGNAL
+    # BUY
     # ========================================================
 
+    if signal == "BUY":
+
+        structural_sl = float(
+            recent["low"].min()
+        )
+
+        atr_sl = (
+            entry
+            - (1.5 * atr14)
+        )
+
+        stop_loss = min(
+            structural_sl,
+            atr_sl,
+        )
+
+        stop_distance = (
+            entry
+            - stop_loss
+        )
+
+        if stop_distance <= 0:
+
+            return {
+                "entry": entry,
+                "stop_loss": None,
+                "take_profit": None,
+                "risk_reward": None,
+                "stop_distance": None,
+                "target_distance": None,
+            }
+
+        # Objectif standard = 2R
+        target_distance = (
+            stop_distance * 2.0
+        )
+
+        raw_take_profit = (
+            entry
+            + target_distance
+        )
+
+        # Résistance
+        resistance = lv["resistance"]
+
+        room = max(
+            0.0,
+            resistance - entry,
+        )
+
+        # Si résistance avant le TP standard,
+        # on adapte le TP à cette résistance.
+        if (
+            room > 0
+            and room < target_distance
+        ):
+
+            target_distance = room
+
+            take_profit = resistance
+
+            risk_reward = (
+                target_distance
+                / stop_distance
+            )
+
+        else:
+
+            take_profit = raw_take_profit
+
+            risk_reward = 2.0
+
+    # ========================================================
+    # SELL
+    # ========================================================
+
+    elif signal == "SELL":
+
+        structural_sl = float(
+            recent["high"].max()
+        )
+
+        atr_sl = (
+            entry
+            + (1.5 * atr14)
+        )
+
+        stop_loss = max(
+            structural_sl,
+            atr_sl,
+        )
+
+        stop_distance = (
+            stop_loss
+            - entry
+        )
+
+        if stop_distance <= 0:
+
+            return {
+                "entry": entry,
+                "stop_loss": None,
+                "take_profit": None,
+                "risk_reward": None,
+                "stop_distance": None,
+                "target_distance": None,
+            }
+
+        # Objectif standard = 2R
+        target_distance = (
+            stop_distance * 2.0
+        )
+
+        raw_take_profit = (
+            entry
+            - target_distance
+        )
+
+        # Support
+        support = lv["support"]
+
+        room = max(
+            0.0,
+            entry - support,
+        )
+
+        # Si support avant le TP standard,
+        # on adapte le TP à ce support.
+        if (
+            room > 0
+            and room < target_distance
+        ):
+
+            target_distance = room
+
+            take_profit = support
+
+            risk_reward = (
+                target_distance
+                / stop_distance
+            )
+
+        else:
+
+            take_profit = raw_take_profit
+
+            risk_reward = 2.0
+
+    # ========================================================
+    # VALIDATION RR
+    # ========================================================
+
+    if (
+        risk_reward is not None
+        and risk_reward < MIN_RR
+    ):
+
+        stop_loss = None
+        take_profit = None
+        risk_reward = None
+        stop_distance = None
+        target_distance = None
+
+    return {
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "risk_reward": risk_reward,
+        "stop_distance": stop_distance,
+        "target_distance": target_distance,
+    }
+
+
+# ============================================================
+# MOTEUR DE DECISION — 4 BLOCS
+# ============================================================
+
+def decision_engine(
+    df: pd.DataFrame,
+    ind: Dict[str, float],
+    market: Dict[str, Any],
+    lv: Dict[str, float],
+) -> Dict[str, Any]:
+
+    """
+    4 blocs :
+
+    BLOC 1 : Tendance + Support/Resistance
+    BLOC 2 : Confirmation multi-indicateurs
+    BLOC 3 : Qualité du setup + signal
+    BLOC 4 : Plan de trade dynamique
+    """
+
+    close = float(
+        df["close"].iloc[-1]
+    )
+
+    ema9 = ind["ema9"]
+    ema21 = ind["ema21"]
+
+    # ========================================================
+    # BLOC 1 — FILTRE DE TENDANCE
+    # ========================================================
+
+    trend_score = 0
+
+    trend_reasons: List[str] = []
+
+    # EMA9 / EMA21
+    if ema9 > ema21:
+
+        trend_score += 1
+
+        trend_reasons.append(
+            "EMA9 au-dessus de EMA21"
+        )
+
+    elif ema9 < ema21:
+
+        trend_score -= 1
+
+        trend_reasons.append(
+            "EMA9 sous EMA21"
+        )
+
+    else:
+
+        trend_reasons.append(
+            "EMA9 et EMA21 proches"
+        )
+
+    # Prix / EMA9
+    if close > ema9:
+
+        trend_score += 1
+
+        trend_reasons.append(
+            "Prix au-dessus de EMA9"
+        )
+
+    elif close < ema9:
+
+        trend_score -= 1
+
+        trend_reasons.append(
+            "Prix sous EMA9"
+        )
+
+    else:
+
+        trend_reasons.append(
+            "Prix proche de EMA9"
+        )
+
+    trend = (
+        "BULLISH"
+        if trend_score >= 2
+        else "BEARISH"
+        if trend_score <= -2
+        else "NEUTRAL"
+    )
+
+    # ========================================================
+    # BLOC 2 — CONFIRMATION
+    # ========================================================
+
+    confirmation = confirmation_block(
+        df,
+        ind,
+        market,
+    )
+
+    confirmation_score = (
+        confirmation["score"]
+    )
+
+    confirmation_reasons = (
+        confirmation["reasons"]
+    )
+
+    # IMPORTANT :
+    # On conserve le calcul de score validé en 4.0.1 :
+    #
+    # tendance = 2 points maximum
+    # confirmation = 3 points maximum
+    #
+    # Total = -5 à +5
     score = (
         trend_score
         + confirmation_score
     )
 
-    # Une faible volatilité réduit
-    # la conviction mais n'inverse
-    # jamais le signal.
+    # ========================================================
+    # SUPPORT / RESISTANCE
+    # ========================================================
+
+    level_ctx = level_context(
+        close,
+        ind["atr14"],
+        lv,
+    )
+
+    # BUY bloqué si résistance trop proche
+    if (
+        score >= 3
+        and level_ctx["buy_blocked"]
+    ):
+
+        score = 2
+
+        confirmation_reasons.append(
+            "BUY bloque: resistance trop proche"
+        )
+
+    # SELL bloqué si support trop proche
+    if (
+        score <= -3
+        and level_ctx["sell_blocked"]
+    ):
+
+        score = -2
+
+        confirmation_reasons.append(
+            "SELL bloque: support trop proche"
+        )
+
+    # ========================================================
+    # FILTRE DE VOLATILITE
+    # ========================================================
 
     if (
         market["volatility_state"]
@@ -667,10 +1223,14 @@ def decision_engine(
             np.sign(score) * 2
         )
 
-        reasons.append(
-            "Filtre de volatilité: "
-            "conviction réduite"
+        confirmation_reasons.append(
+            "Filtre de volatilite: "
+            "conviction reduite"
         )
+
+    # ========================================================
+    # SIGNAL
+    # ========================================================
 
     if score >= 3:
 
@@ -683,6 +1243,10 @@ def decision_engine(
     else:
 
         signal = "WAIT"
+
+    # ========================================================
+    # CONFIDENCE
+    # ========================================================
 
     confidence = (
         50
@@ -710,104 +1274,107 @@ def decision_engine(
     )
 
     # ========================================================
+    # BLOC 3 — QUALITE DU SETUP
+    # ========================================================
+
+    quality = calculate_setup_quality(
+        signal=signal,
+        trend_score=trend_score,
+        confirmation_score=confirmation_score,
+        ind=ind,
+        market=market,
+        level_ctx=level_ctx,
+    )
+
+    # ========================================================
     # BLOC 4 — PLAN DE TRADE
     # ========================================================
 
-    entry = close
+    plan = calculate_trade_plan(
+        df=df,
+        signal=signal,
+        atr14=ind["atr14"],
+        lv=lv,
+    )
 
-    stop_loss: Optional[float] = None
-    take_profit: Optional[float] = None
-    risk_reward: Optional[float] = None
-    stop_distance: Optional[float] = None
-    target_distance: Optional[float] = None
+    # ========================================================
+    # VALIDATION FINALE DU PLAN
+    # ========================================================
 
-    recent = df.tail(20)
+    if (
+        signal in ("BUY", "SELL")
+        and plan["risk_reward"] is None
+    ):
 
-    if signal == "BUY":
-
-        structural_sl = float(
-            recent["low"].min()
+        confirmation_reasons.append(
+            "Plan annule: espace ou "
+            "ratio risque/rendement insuffisant"
         )
 
-        atr_sl = (
-            entry
-            - (1.5 * atr14)
+        signal = "WAIT"
+
+        confidence = min(
+            confidence,
+            66,
         )
 
-        stop_loss = min(
-            structural_sl,
-            atr_sl,
+        plan = calculate_trade_plan(
+            df=df,
+            signal="WAIT",
+            atr14=ind["atr14"],
+            lv=lv,
         )
 
-        stop_distance = (
-            entry
-            - stop_loss
+    # ========================================================
+    # VOLATILITE DANS LES RAISONS
+    # ========================================================
+
+    if (
+        market["volatility_state"]
+        == "LOW"
+    ):
+
+        confirmation_reasons.append(
+            "Volatilite faible"
         )
 
-        if stop_distance > 0:
+    elif (
+        market["volatility_state"]
+        == "HIGH"
+    ):
 
-            target_distance = (
-                stop_distance * 2.0
-            )
-
-            take_profit = (
-                entry
-                + target_distance
-            )
-
-            risk_reward = 2.0
-
-    elif signal == "SELL":
-
-        structural_sl = float(
-            recent["high"].max()
+        confirmation_reasons.append(
+            "Volatilite elevee"
         )
 
-        atr_sl = (
-            entry
-            + (1.5 * atr14)
-        )
-
-        stop_loss = max(
-            structural_sl,
-            atr_sl,
-        )
-
-        stop_distance = (
-            stop_loss
-            - entry
-        )
-
-        if stop_distance > 0:
-
-            target_distance = (
-                stop_distance * 2.0
-            )
-
-            take_profit = (
-                entry
-                - target_distance
-            )
-
-            risk_reward = 2.0
+    # ========================================================
+    # RESULTAT DU MOTEUR
+    # ========================================================
 
     return {
         "trend": trend,
         "score": int(score),
         "signal": signal,
         "confidence": confidence,
+
+        "setup_quality": quality,
+
+        "trend_score": int(
+            trend_score
+        ),
+
+        "confirmation_score": int(
+            confirmation_score
+        ),
+
+        "level_context": level_ctx,
+
         "reasons": (
             trend_reasons
-            + reasons
+            + confirmation_reasons
         ),
-        "trade_plan": {
-            "entry": entry,
-            "stop_loss": stop_loss,
-            "take_profit": take_profit,
-            "risk_reward": risk_reward,
-            "stop_distance": stop_distance,
-            "target_distance": target_distance,
-        },
+
+        "trade_plan": plan,
     }
 
 
@@ -845,6 +1412,10 @@ def analyze_candles(
             ),
         )
 
+    # --------------------------------------------------------
+    # Calculs
+    # --------------------------------------------------------
+
     ind = calculate_indicators(
         df
     )
@@ -865,52 +1436,180 @@ def analyze_candles(
         lv,
     )
 
+    # --------------------------------------------------------
+    # Réponse
+    # --------------------------------------------------------
+
     return {
         "status": "success",
+
         "engine_version": APP_VERSION,
+
         "asset": asset,
+
         "timeframe": timeframe,
+
         "price": float(
             df["close"].iloc[-1]
         ),
-        "signal": decision["signal"],
+
+        "signal": decision[
+            "signal"
+        ],
+
         "confidence": decision[
             "confidence"
         ],
-        "score": decision["score"],
-        "trend": decision["trend"],
+
+        "score": decision[
+            "score"
+        ],
+
+        "trend": decision[
+            "trend"
+        ],
+
+        # ====================================================
+        # NOUVEAU 4.1
+        # ====================================================
+
+        "setup_quality": decision[
+            "setup_quality"
+        ],
+
+        "scores": {
+            "trend": decision[
+                "trend_score"
+            ],
+
+            "confirmation": decision[
+                "confirmation_score"
+            ],
+
+            "total": decision[
+                "score"
+            ],
+        },
+
+        # ====================================================
+        # INDICATEURS
+        # ====================================================
+
         "indicators": {
-            k: round(v, 8)
+            k: round(
+                v,
+                8,
+            )
             for k, v in ind.items()
         },
+
+        # ====================================================
+        # MARCHE
+        # ====================================================
+
         "market": {
             "candle_direction": market[
                 "candle_direction"
             ],
+
             "average_range": round(
-                market["average_range"],
+                market[
+                    "average_range"
+                ],
                 8,
             ),
+
             "recent_average_range": round(
                 market[
                     "recent_average_range"
                 ],
                 8,
             ),
+
             "volatility_ratio": round(
                 market[
                     "volatility_ratio"
                 ],
                 3,
             ),
+
             "volatility_state": market[
                 "volatility_state"
             ],
         },
+
+        # ====================================================
+        # SUPPORT / RESISTANCE
+        # ====================================================
+
         "levels": {
-            k: round(v, 8)
+            k: round(
+                v,
+                8,
+            )
             for k, v in lv.items()
         },
+
+        "level_context": {
+            "distance_to_support": round(
+                decision[
+                    "level_context"
+                ][
+                    "distance_to_support"
+                ],
+                8,
+            ),
+
+            "distance_to_resistance": round(
+                decision[
+                    "level_context"
+                ][
+                    "distance_to_resistance"
+                ],
+                8,
+            ),
+
+            "support_atr": round(
+                decision[
+                    "level_context"
+                ][
+                    "support_atr"
+                ],
+                3,
+            ),
+
+            "resistance_atr": round(
+                decision[
+                    "level_context"
+                ][
+                    "resistance_atr"
+                ],
+                3,
+            ),
+
+            "buy_blocked": decision[
+                "level_context"
+            ][
+                "buy_blocked"
+            ],
+
+            "sell_blocked": decision[
+                "level_context"
+            ][
+                "sell_blocked"
+            ],
+
+            "level_bias": decision[
+                "level_context"
+            ][
+                "level_bias"
+            ],
+        },
+
+        # ====================================================
+        # PLAN DE TRADE
+        # ====================================================
+
         "trade_plan": {
             k: (
                 None
@@ -924,10 +1623,21 @@ def analyze_candles(
                 "trade_plan"
             ].items()
         },
+
+        # ====================================================
+        # RAISONS
+        # ====================================================
+
         "reasons": decision[
             "reasons"
         ],
+
+        # ====================================================
+        # BOUGIES
+        # ====================================================
+
         "candles_count": len(df),
+
         "candles": (
             df[
                 [
@@ -956,7 +1666,7 @@ def root() -> Dict[str, str]:
         "name": "Pocket AI Trader",
         "version": APP_VERSION,
         "status": "online",
-        "engine": "4-bloc decision engine",
+        "engine": "4-bloc decision engine v4.1",
     }
 
 
