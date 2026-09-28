@@ -1714,6 +1714,151 @@ def analyze(
     request: AnalyzeRequest,
 ) -> Dict[str, Any]:
 
+    
+# ============================================================
+# TEST TRADE PLAN — BUY / SELL
+# ============================================================
+
+def test_trade_plan(
+    forced_signal: str,
+) -> Dict[str, Any]:
+
+    candles = fetch_candles(
+        ASSET,
+        TIMEFRAME,
+        CANDLE_LIMIT,
+    )
+
+    df = to_dataframe(candles)
+
+    if len(df) < 30:
+        raise HTTPException(
+            status_code=422,
+            detail="Nombre de bougies insuffisant pour le test."
+        )
+
+    # Calcul des indicateurs réels
+    ind = calculate_indicators(df)
+
+    # Niveaux réels
+    lv = levels(df)
+
+    # Plan forcé uniquement pour tester le moteur SL/TP
+    trade_plan = calculate_trade_plan(
+        df=df,
+        signal=forced_signal,
+        atr14=ind["atr14"],
+        lv=lv,
+    )
+
+    return {
+        "status": "success",
+        "engine_version": APP_VERSION,
+        "test_mode": True,
+        "test_type": forced_signal,
+        "asset": ASSET,
+        "timeframe": TIMEFRAME,
+
+        "price": float(
+            df["close"].iloc[-1]
+        ),
+
+        "signal": forced_signal,
+
+        "indicators": {
+            "ema9": round(
+                ind["ema9"],
+                8,
+            ),
+            "ema21": round(
+                ind["ema21"],
+                8,
+            ),
+            "rsi14": round(
+                ind["rsi14"],
+                8,
+            ),
+            "momentum_5": round(
+                ind["momentum_5"],
+                8,
+            ),
+            "atr14": round(
+                ind["atr14"],
+                8,
+            ),
+        },
+
+        "levels": {
+            "support": round(
+                lv["support"],
+                8,
+            ),
+            "resistance": round(
+                lv["resistance"],
+                8,
+            ),
+        },
+
+        "trade_plan": {
+            k: (
+                None
+                if v is None
+                else round(
+                    float(v),
+                    8,
+                )
+            )
+            for k, v in trade_plan.items()
+        },
+
+        "validation": {
+            "entry_valid": (
+                trade_plan["entry"] is not None
+            ),
+
+            "stop_loss_valid": (
+                trade_plan["stop_loss"] is not None
+            ),
+
+            "take_profit_valid": (
+                trade_plan["take_profit"] is not None
+            ),
+
+            "risk_reward_valid": (
+                trade_plan["risk_reward"] is not None
+                and trade_plan["risk_reward"] >= MIN_RR
+            ),
+
+            "trade_plan_valid": (
+                trade_plan["entry"] is not None
+                and trade_plan["stop_loss"] is not None
+                and trade_plan["take_profit"] is not None
+                and trade_plan["risk_reward"] is not None
+                and trade_plan["risk_reward"] >= MIN_RR
+            ),
+        },
+    }
+
+
+# ============================================================
+# TEST BUY
+# ============================================================
+
+@app.get("/test/buy")
+def test_buy() -> Dict[str, Any]:
+
+    return test_trade_plan("BUY")
+
+
+# ============================================================
+# TEST SELL
+# ============================================================
+
+@app.get("/test/sell")
+def test_sell() -> Dict[str, Any]:
+
+    return test_trade_plan("SELL")
+
     return analyze_candles(
         [
             c.model_dump()
