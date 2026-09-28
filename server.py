@@ -14,8 +14,15 @@ from pydantic import BaseModel, Field
 # ============================================================
 
 APP_VERSION = "4.0.0"
+
+# Format interne du moteur
 ASSET = "EURUSD"
 TIMEFRAME = "15m"
+
+# Format utilisé par Twelve Data
+TWELVE_DATA_SYMBOL = "EUR/USD"
+TWELVE_DATA_INTERVAL = "15min"
+
 CANDLE_LIMIT = 100
 
 
@@ -26,7 +33,7 @@ CANDLE_LIMIT = 100
 app = FastAPI(
     title="Pocket AI Trader",
     description="Moteur d'analyse technique Forex avec donnees reelles",
-    version="4.0.0",
+    version=APP_VERSION,
 )
 
 app.add_middleware(
@@ -61,12 +68,16 @@ class AnalyzeRequest(BaseModel):
 # ============================================================
 
 def get_api_key() -> str:
+
     key = os.getenv("TWELVE_DATA_API_KEY")
 
     if not key:
         raise HTTPException(
             status_code=500,
-            detail="La variable TWELVE_DATA_API_KEY n'est pas configuree sur Render.",
+            detail=(
+                "La variable TWELVE_DATA_API_KEY "
+                "n'est pas configuree sur Render."
+            ),
         )
 
     return key
@@ -82,9 +93,25 @@ def fetch_candles(
 
     url = "https://api.twelvedata.com/time_series"
 
+    # ========================================================
+    # CONVERSION FORMAT INTERNE -> TWELVE DATA
+    # ========================================================
+
+    api_symbol = (
+        TWELVE_DATA_SYMBOL
+        if asset == "EURUSD"
+        else asset
+    )
+
+    api_interval = (
+        TWELVE_DATA_INTERVAL
+        if timeframe == "15m"
+        else timeframe
+    )
+
     params = {
-        "symbol": asset,
-        "interval": timeframe,
+        "symbol": api_symbol,
+        "interval": api_interval,
         "outputsize": outputsize,
         "apikey": key,
         "format": "JSON",
@@ -92,42 +119,72 @@ def fetch_candles(
     }
 
     try:
+
         response = requests.get(
             url,
             params=params,
             timeout=15,
         )
 
-        response.raise_for_status()
         payload = response.json()
 
     except requests.RequestException as exc:
+
         raise HTTPException(
             status_code=502,
-            detail=f"Erreur Twelve Data: {exc}",
+            detail=(
+                f"Erreur de connexion Twelve Data: "
+                f"{exc}"
+            ),
         )
 
-    if payload.get("status") == "error":
+    except ValueError:
+
         raise HTTPException(
             status_code=502,
-            detail=payload.get(
-                "message",
-                "Erreur Twelve Data",
+            detail=(
+                "Twelve Data a retourne "
+                "une reponse JSON invalide."
+            ),
+        )
+
+    # ========================================================
+    # GESTION ERREUR TWELVE DATA
+    # ========================================================
+
+    if payload.get("status") == "error":
+
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Erreur Twelve Data "
+                f"{payload.get('code', '')}: "
+                f"{payload.get('message', 'Erreur inconnue')}"
             ),
         )
 
     values = payload.get("values")
 
     if not values:
+
         raise HTTPException(
             status_code=502,
-            detail="Twelve Data n'a retourne aucune bougie.",
+            detail=(
+                "Twelve Data n'a retourne "
+                "aucune bougie."
+            ),
         )
+
+    # ========================================================
+    # CONVERSION DES BOUGIES
+    # ========================================================
 
     candles: List[Dict[str, float]] = []
 
     for row in values:
+
         try:
+
             candles.append(
                 {
                     "open": float(row["open"]),
@@ -140,13 +197,22 @@ def fetch_candles(
                 }
             )
 
-        except (KeyError, TypeError, ValueError):
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+        ):
+
             continue
 
     if len(candles) < 30:
+
         raise HTTPException(
             status_code=502,
-            detail=f"Nombre de bougies insuffisant: {len(candles)}",
+            detail=(
+                f"Nombre de bougies insuffisant: "
+                f"{len(candles)}"
+            ),
         )
 
     return candles[-outputsize:]
@@ -169,6 +235,7 @@ def to_dataframe(
         "close",
         "volume",
     ]:
+
         df[col] = pd.to_numeric(
             df[col],
             errors="coerce",
@@ -345,12 +412,15 @@ def market_context(
     )
 
     if volatility_ratio < 0.70:
+
         volatility_state = "LOW"
 
     elif volatility_ratio > 1.30:
+
         volatility_state = "HIGH"
 
     else:
+
         volatility_state = "NORMAL"
 
     return {
@@ -396,6 +466,7 @@ def decision_engine(
 
     """
     Four blocs:
+
     1. Tendance
     2. Confirmation
     3. Signal
