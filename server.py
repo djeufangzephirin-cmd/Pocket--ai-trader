@@ -13,13 +13,13 @@ from pydantic import BaseModel, Field
 # CONFIGURATION
 # ============================================================
 
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.0.1"
 
 # Format interne du moteur
 ASSET = "EURUSD"
 TIMEFRAME = "15m"
 
-# Format utilisé par Twelve Data
+# Format Twelve Data
 TWELVE_DATA_SYMBOL = "EUR/USD"
 TWELVE_DATA_INTERVAL = "15min"
 
@@ -93,10 +93,7 @@ def fetch_candles(
 
     url = "https://api.twelvedata.com/time_series"
 
-    # ========================================================
-    # CONVERSION FORMAT INTERNE -> TWELVE DATA
-    # ========================================================
-
+    # Conversion format interne -> Twelve Data
     api_symbol = (
         TWELVE_DATA_SYMBOL
         if asset == "EURUSD"
@@ -148,10 +145,7 @@ def fetch_candles(
             ),
         )
 
-    # ========================================================
-    # GESTION ERREUR TWELVE DATA
-    # ========================================================
-
+    # Gestion explicite des erreurs Twelve Data
     if payload.get("status") == "error":
 
         raise HTTPException(
@@ -174,10 +168,6 @@ def fetch_candles(
                 "aucune bougie."
             ),
         )
-
-    # ========================================================
-    # CONVERSION DES BOUGIES
-    # ========================================================
 
     candles: List[Dict[str, float]] = []
 
@@ -268,7 +258,6 @@ def rsi(
     delta = series.diff()
 
     gain = delta.clip(lower=0)
-
     loss = -delta.clip(upper=0)
 
     avg_gain = gain.ewm(
@@ -283,16 +272,47 @@ def rsi(
         min_periods=period,
     ).mean()
 
-    rs = avg_gain / avg_loss.replace(
-        0,
-        np.nan,
+    # Valeur neutre par défaut
+    result = pd.Series(
+        50.0,
+        index=series.index,
+        dtype=float,
     )
 
-    result = 100 - (
-        100 / (1 + rs)
+    # Marché fortement haussier
+    bullish = (
+        (avg_loss == 0)
+        & (avg_gain > 0)
     )
 
-    result = result.fillna(50.0)
+    result.loc[bullish] = 100.0
+
+    # Marché fortement baissier
+    bearish = (
+        (avg_gain == 0)
+        & (avg_loss > 0)
+    )
+
+    result.loc[bearish] = 0.0
+
+    # Cas normal
+    normal = (
+        (avg_gain > 0)
+        & (avg_loss > 0)
+    )
+
+    rs = (
+        avg_gain[normal]
+        / avg_loss[normal]
+    )
+
+    result.loc[normal] = (
+        100
+        - (
+            100
+            / (1 + rs)
+        )
+    )
 
     return result
 
