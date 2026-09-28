@@ -2,6 +2,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List
+import os
+import json
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 
 # ============================================================
@@ -10,8 +15,8 @@ from typing import List
 
 app = FastAPI(
     title="Pocket AI Trader",
-    description="Moteur d'analyse technique Forex",
-    version="2.3.0"
+    description="Moteur d'analyse technique Forex avec données réelles",
+    version="2.4.0"
 )
 
 app.add_middleware(
@@ -21,6 +26,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
+
+TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
+
+DEFAULT_ASSET = "EURUSD"
+DEFAULT_TIMEFRAME = "15m"
+DEFAULT_INTERVAL = "15min"
+DEFAULT_OUTPUTSIZE = 25
 
 
 # ============================================================
@@ -39,6 +58,158 @@ class AnalyzeRequest(BaseModel):
     asset: str = "EURUSD"
     timeframe: str = "15m"
     candles: List[Candle]
+
+
+# ============================================================
+# NORMALISATION SYMBOLE
+# ============================================================
+
+def normalize_symbol(asset: str) -> str:
+
+    asset = asset.upper().strip()
+
+    if asset == "EURUSD":
+        return "EUR/USD"
+
+    return asset
+
+
+# ============================================================
+# RECUPERATION TWELVE DATA
+# ============================================================
+
+def get_real_candles(
+    asset: str = DEFAULT_ASSET,
+    timeframe: str = DEFAULT_TIMEFRAME,
+    outputsize: int = DEFAULT_OUTPUTSIZE
+) -> List[Candle]:
+
+    if not TWELVE_DATA_API_KEY:
+
+        raise HTTPException(
+            status_code=500,
+            detail="La variable TWELVE_DATA_API_KEY n'est pas configurée sur Render."
+        )
+
+    if timeframe != "15m":
+
+        raise HTTPException(
+            status_code=400,
+            detail="Pour cette étape, seul le timeframe 15m est activé."
+        )
+
+    if outputsize < 25:
+        outputsize = 25
+
+    if outputsize > 5000:
+        outputsize = 5000
+
+    symbol = normalize_symbol(asset)
+
+    params = {
+        "symbol": symbol,
+        "interval": DEFAULT_INTERVAL,
+        "outputsize": outputsize,
+        "apikey": TWELVE_DATA_API_KEY,
+        "timezone": "UTC",
+        "format": "JSON"
+    }
+
+    url = TWELVE_DATA_URL + "?" + urlencode(params)
+
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "Pocket-AI-Trader/2.4"
+        }
+    )
+
+    try:
+
+        with urlopen(request, timeout=15) as response:
+
+            raw_data = response.read().decode("utf-8")
+
+            data = json.loads(raw_data)
+
+    except HTTPError as exc:
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"Erreur HTTP Twelve Data: {exc.code}"
+        )
+
+    except URLError:
+
+        raise HTTPException(
+            status_code=502,
+            detail="Impossible de joindre Twelve Data."
+        )
+
+    except Exception:
+
+        raise HTTPException(
+            status_code=502,
+            detail="Erreur lors de la récupération des données de marché."
+        )
+
+    # --------------------------------------------------------
+    # ERREUR FOURNISSEUR
+    # --------------------------------------------------------
+
+    if data.get("status") == "error":
+
+        message = data.get(
+            "message",
+            "Erreur inconnue Twelve Data."
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"Twelve Data: {message}"
+        )
+
+    values = data.get("values")
+
+    if not values:
+
+        raise HTTPException(
+            status_code=502,
+            detail="Twelve Data n'a retourné aucune bougie."
+        )
+
+    candles = []
+
+    for item in values:
+
+        try:
+
+            candle = Candle(
+                open=float(item["open"]),
+                high=float(item["high"]),
+                low=float(item["low"]),
+                close=float(item["close"]),
+                volume=float(item.get("volume", 0) or 0)
+            )
+
+            candles.append(candle)
+
+        except (KeyError, TypeError, ValueError):
+
+            continue
+
+    if len(candles) < 25:
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"Seulement {len(candles)} bougies valides reçues. 25 minimum sont nécessaires."
+        )
+
+    # Twelve Data retourne généralement les plus récentes
+    # en premier. On remet les bougies dans l'ordre chronologique.
+    candles.reverse()
+
+    return candles
 
 
 # ============================================================
@@ -76,14 +247,17 @@ def calculate_rsi(values: List[float], period: int = 14) -> float:
         change = values[i] - values[i - 1]
 
         if change > 0:
+
             gains.append(change)
             losses.append(0.0)
 
         elif change < 0:
+
             gains.append(0.0)
             losses.append(abs(change))
 
         else:
+
             gains.append(0.0)
             losses.append(0.0)
 
@@ -131,7 +305,7 @@ def calculate_momentum(
 
 
 # ============================================================
-# UTILITAIRES
+# UTILITAIRE
 # ============================================================
 
 def clamp(value: int, minimum: int, maximum: int) -> int:
@@ -140,17 +314,14 @@ def clamp(value: int, minimum: int, maximum: int) -> int:
 
 
 # ============================================================
-# ANALYSE
+# MOTEUR D'ANALYSE
 # ============================================================
 
-@app.post("/analyze")
-def analyze_market(data: AnalyzeRequest):
-
-    candles = data.candles
-
-    # --------------------------------------------------------
-    # VALIDATION
-    # --------------------------------------------------------
+def analyze_candles(
+    candles: List[Candle],
+    asset: str,
+    timeframe: str
+):
 
     if len(candles) < 25:
 
@@ -393,17 +564,6 @@ def analyze_market(data: AnalyzeRequest):
     # ========================================================
     # 5. VOLATILITE
     # ========================================================
-    #
-    # Nouvelle logique :
-    #
-    # 1. Ratio récent / moyen
-    # 2. Range moyen normalisé par le prix
-    #
-    # Cela évite qu'un marché extrêmement volatil soit
-    # considéré NORMAL simplement parce que toutes les
-    # bougies sont elles-mêmes très larges.
-    #
-    # ========================================================
 
     volatility_ratio = 0.0
 
@@ -413,7 +573,6 @@ def analyze_market(data: AnalyzeRequest):
             recent_average_range / average_range
         )
 
-    # Volatilité moyenne exprimée en % du prix
     range_ratio = 0.0
 
     if closes[-1] > 0:
@@ -421,10 +580,6 @@ def analyze_market(data: AnalyzeRequest):
         range_ratio = (
             average_range / closes[-1]
         )
-
-    # --------------------------------------------------------
-    # Classification
-    # --------------------------------------------------------
 
     if average_range == 0:
 
@@ -515,7 +670,7 @@ def analyze_market(data: AnalyzeRequest):
             trend = "NEUTRAL"
 
     # ========================================================
-    # FILTRE DE CONTRADICTION
+    # FILTRE CONTRADICTION
     # ========================================================
 
     strong_contradiction = False
@@ -616,7 +771,10 @@ def analyze_market(data: AnalyzeRequest):
 
             confidence -= 5
 
-        confidence = max(50, min(confidence, 90))
+        confidence = max(
+            50,
+            min(confidence, 90)
+        )
 
     # ========================================================
     # REPONSE
@@ -626,9 +784,9 @@ def analyze_market(data: AnalyzeRequest):
 
         "status": "success",
 
-        "asset": data.asset,
+        "asset": asset,
 
-        "timeframe": data.timeframe,
+        "timeframe": timeframe,
 
         "price": closes[-1],
 
@@ -696,6 +854,88 @@ def analyze_market(data: AnalyzeRequest):
 
 
 # ============================================================
+# ANALYSE MANUELLE
+# ============================================================
+
+@app.post("/analyze")
+def analyze_market(data: AnalyzeRequest):
+
+    return analyze_candles(
+        candles=data.candles,
+        asset=data.asset,
+        timeframe=data.timeframe
+    )
+
+
+# ============================================================
+# DONNEES REELLES
+# ============================================================
+
+@app.get("/market-data")
+def market_data():
+
+    candles = get_real_candles(
+        asset=DEFAULT_ASSET,
+        timeframe=DEFAULT_TIMEFRAME,
+        outputsize=25
+    )
+
+    return {
+
+        "status": "success",
+
+        "source": "Twelve Data",
+
+        "asset": DEFAULT_ASSET,
+
+        "timeframe": DEFAULT_TIMEFRAME,
+
+        "candles_count": len(candles),
+
+        "candles": [
+
+            {
+
+                "open": c.open,
+
+                "high": c.high,
+
+                "low": c.low,
+
+                "close": c.close,
+
+                "volume": c.volume
+
+            }
+
+            for c in candles
+
+        ]
+
+    }
+
+
+# ============================================================
+# ANALYSE REELLE
+# ============================================================
+
+@app.get("/analyze-live")
+def analyze_live():
+
+    candles = get_real_candles(
+        asset=DEFAULT_ASSET,
+        timeframe=DEFAULT_TIMEFRAME,
+        outputsize=25
+    )
+
+    return analyze_candles(
+        candles=candles,
+        asset=DEFAULT_ASSET,
+        timeframe=DEFAULT_TIMEFRAME
+    )
+
+
+# ============================================================
 # ROOT
 # ============================================================
 
@@ -708,8 +948,16 @@ def root():
 
         "service": "Pocket AI Trader",
 
-        "version": "2.3.0",
+        "version": "2.4.0",
 
-        "endpoint": "/analyze"
+        "endpoints": {
+
+            "manual_analysis": "/analyze",
+
+            "real_market_data": "/market-data",
+
+            "live_analysis": "/analyze-live"
+
+        }
 
     }
