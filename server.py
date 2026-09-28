@@ -11,7 +11,7 @@ from typing import List
 app = FastAPI(
     title="Pocket AI Trader",
     description="Moteur d'analyse technique Forex",
-    version="2.2.0"
+    version="2.3.0"
 )
 
 app.add_middleware(
@@ -202,7 +202,6 @@ def analyze_market(data: AnalyzeRequest):
 
     average_range = sum(ranges) / len(ranges)
 
-    # Range des 5 dernières bougies
     recent_ranges = ranges[-5:]
 
     recent_average_range = (
@@ -262,20 +261,7 @@ def analyze_market(data: AnalyzeRequest):
         )
 
     # ========================================================
-    # 2. RSI - CONFIRMATION CONTEXTUELLE
-    # ========================================================
-    #
-    # On ne donne plus automatiquement +1 lorsque RSI > 70
-    # ou -1 lorsque RSI < 30.
-    #
-    # RSI extrême indique également un risque de retournement.
-    # On utilise donc une zone de confirmation plus modérée.
-    #
-    # 50-70 : biais haussier
-    # 30-50 : biais baissier
-    # >70   : surachat / prudence
-    # <30   : survente / prudence
-    #
+    # 2. RSI
     # ========================================================
 
     rsi_signal = 0
@@ -319,12 +305,11 @@ def analyze_market(data: AnalyzeRequest):
         )
 
     # ========================================================
-    # 3. MOMENTUM - INTENSITE
+    # 3. MOMENTUM
     # ========================================================
 
     momentum_signal = 0
 
-    # Faible mouvement
     if abs(momentum5) < 0.03:
 
         momentum_signal = 0
@@ -333,7 +318,6 @@ def analyze_market(data: AnalyzeRequest):
             "Momentum faible"
         )
 
-    # Mouvement modéré
     elif 0.03 <= momentum5 < 0.15:
 
         momentum_signal = 1
@@ -354,7 +338,6 @@ def analyze_market(data: AnalyzeRequest):
             "Momentum baissier modéré"
         )
 
-    # Mouvement fort
     elif momentum5 >= 0.15:
 
         momentum_signal = 2
@@ -411,9 +394,14 @@ def analyze_market(data: AnalyzeRequest):
     # 5. VOLATILITE
     # ========================================================
     #
-    # La volatilité ne crée pas directement un BUY ou SELL.
-    # Elle sert principalement à éviter de qualifier un marché
-    # extrêmement faible comme un signal fort.
+    # Nouvelle logique :
+    #
+    # 1. Ratio récent / moyen
+    # 2. Range moyen normalisé par le prix
+    #
+    # Cela évite qu'un marché extrêmement volatil soit
+    # considéré NORMAL simplement parce que toutes les
+    # bougies sont elles-mêmes très larges.
     #
     # ========================================================
 
@@ -425,13 +413,38 @@ def analyze_market(data: AnalyzeRequest):
             recent_average_range / average_range
         )
 
+    # Volatilité moyenne exprimée en % du prix
+    range_ratio = 0.0
+
+    if closes[-1] > 0:
+
+        range_ratio = (
+            average_range / closes[-1]
+        )
+
+    # --------------------------------------------------------
+    # Classification
+    # --------------------------------------------------------
+
     if average_range == 0:
 
         volatility_state = "VERY_LOW"
 
-    elif volatility_ratio < 0.50:
+    elif range_ratio < 0.00015:
+
+        volatility_state = "VERY_LOW"
+
+    elif range_ratio < 0.00050:
 
         volatility_state = "LOW"
+
+    elif range_ratio > 0.015:
+
+        volatility_state = "HIGH"
+
+    elif range_ratio > 0.003:
+
+        volatility_state = "HIGH"
 
     elif volatility_ratio > 1.80:
 
@@ -440,6 +453,10 @@ def analyze_market(data: AnalyzeRequest):
     else:
 
         volatility_state = "NORMAL"
+
+    # ========================================================
+    # RAISON VOLATILITE
+    # ========================================================
 
     if volatility_state == "VERY_LOW":
 
@@ -466,7 +483,7 @@ def analyze_market(data: AnalyzeRequest):
         )
 
     # ========================================================
-    # NORMALISATION DU SCORE
+    # NORMALISATION SCORE
     # ========================================================
 
     score = clamp(score, -5, 5)
@@ -499,11 +516,6 @@ def analyze_market(data: AnalyzeRequest):
 
     # ========================================================
     # FILTRE DE CONTRADICTION
-    # ========================================================
-    #
-    # Si EMA et momentum s'opposent fortement, on évite de
-    # produire immédiatement un signal directionnel.
-    #
     # ========================================================
 
     strong_contradiction = False
@@ -547,11 +559,6 @@ def analyze_market(data: AnalyzeRequest):
     # ========================================================
     # FILTRE RSI EXTREME
     # ========================================================
-    #
-    # Un RSI > 70 ne provoque plus automatiquement un BUY.
-    # Un RSI < 30 ne provoque plus automatiquement un SELL.
-    #
-    # ========================================================
 
     if signal == "BUY" and rsi14 >= 75:
 
@@ -570,16 +577,12 @@ def analyze_market(data: AnalyzeRequest):
         signal = "WAIT"
 
     # ========================================================
-    # FILTRE DE VOLATILITE EXTREMEMENT FAIBLE
+    # FILTRE VOLATILITE EXTREMEMENT FAIBLE
     # ========================================================
 
     if signal in ("BUY", "SELL"):
 
         if average_range > 0:
-
-            # Seuil volontairement prudent.
-            # Pour EURUSD autour de 1.08, cela correspond
-            # approximativement à 1.6 pip de range moyen.
 
             MIN_RANGE_RATIO = 0.00015
 
@@ -596,11 +599,6 @@ def analyze_market(data: AnalyzeRequest):
     # ========================================================
     # CONFIANCE
     # ========================================================
-    #
-    # Ceci est un indice de force du signal.
-    # Ce n'est PAS une probabilité de gain.
-    #
-    # ========================================================
 
     if signal == "WAIT":
 
@@ -612,7 +610,7 @@ def analyze_market(data: AnalyzeRequest):
 
         if volatility_state == "HIGH":
 
-            confidence -= 5
+            confidence -= 10
 
         if rsi14 >= 70 or rsi14 <= 30:
 
@@ -710,8 +708,8 @@ def root():
 
         "service": "Pocket AI Trader",
 
-        "version": "2.2.0",
+        "version": "2.3.0",
 
         "endpoint": "/analyze"
 
-                  }
+    }
