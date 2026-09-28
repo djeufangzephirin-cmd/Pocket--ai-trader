@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 import requests
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -15,41 +16,30 @@ from pydantic import BaseModel, Field
 
 APP_VERSION = "4.1.0"
 
-# Format interne du moteur
 ASSET = "EURUSD"
 TIMEFRAME = "15m"
 
-# Format Twelve Data
-TWELVE_DATA_SYMBOL = "EUR/USD"
-TWELVE_DATA_INTERVAL = "15min"
+TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
 
-CANDLE_LIMIT = 100
-
-# Paramètres moteur 4.1
-LOW_VOLATILITY_THRESHOLD = 0.70
-HIGH_VOLATILITY_THRESHOLD = 1.30
-
-# Distance minimale d'un niveau opposé exprimée en ATR
-LEVEL_BUFFER_ATR = 0.50
-
-# Ratio risque/rendement minimal accepté
-MIN_RR = 1.50
+DEFAULT_CANDLES = 100
+MIN_CANDLES = 30
+MAX_CANDLES = 500
 
 
 # ============================================================
-# APPLICATION
+# FASTAPI
 # ============================================================
 
 app = FastAPI(
     title="Pocket AI Trader",
-    description="Moteur d'analyse technique Forex avec donnees reelles",
+    description="Trading analysis engine - EURUSD 15m",
     version=APP_VERSION,
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -59,18 +49,62 @@ app.add_middleware(
 # MODELS
 # ============================================================
 
-class Candle(BaseModel):
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float = 0.0
-
-
 class AnalyzeRequest(BaseModel):
     asset: str = Field(default=ASSET)
     timeframe: str = Field(default=TIMEFRAME)
-    candles: List[Candle] = Field(min_length=30)
+    candles: int = Field(
+        default=DEFAULT_CANDLES,
+        ge=MIN_CANDLES,
+        le=MAX_CANDLES,
+    )
+
+
+# ============================================================
+# UTILITAIRES
+# ============================================================
+
+def normalize_asset(asset: str) -> str:
+    asset = asset.strip().upper()
+
+    if "/" in asset:
+        return asset
+
+    if len(asset) == 6:
+        return f"{asset[:3]}/{asset[3:]}"
+
+    return asset
+
+
+def normalize_interval(timeframe: str) -> str:
+    timeframe = timeframe.strip().lower()
+
+    mapping = {
+        "1m": "1min",
+        "5m": "5min",
+        "15m": "15min",
+        "30m": "30min",
+        "1h": "1h",
+        "4h": "4h",
+        "1d": "1day",
+    }
+
+    return mapping.get(timeframe, timeframe)
+
+
+def safe_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+
+        result = float(value)
+
+        if not np.isfinite(result):
+            return None
+
+        return result
+
+    except (ValueError, TypeError):
+        return None
 
 
 # ============================================================
@@ -78,189 +112,142 @@ class AnalyzeRequest(BaseModel):
 # ============================================================
 
 def get_api_key() -> str:
+    api_key = os.getenv("TWELVE_DATA_API_KEY")
 
-    key = os.getenv("TWELVE_DATA_API_KEY")
-
-    if not key:
+    if not api_key:
         raise HTTPException(
             status_code=500,
-            detail=(
-                "La variable TWELVE_DATA_API_KEY "
-                "n'est pas configuree sur Render."
-            ),
+            detail="La variable TWELVE_DATA_API_KEY n'est pas configurée sur Render.",
         )
 
-    return key
+    return api_key
 
 
 def fetch_candles(
     asset: str = ASSET,
     timeframe: str = TIMEFRAME,
-    outputsize: int = CANDLE_LIMIT,
-) -> List[Dict[str, float]]:
+    outputsize: int = DEFAULT_CANDLES,
+) -> pd.DataFrame:
 
-    key = get_api_key()
+    api_key = get_api_key()
 
-    url = "https://api.twelvedata.com/time_series"
-
-    # Conversion format interne -> Twelve Data
-    api_symbol = (
-        TWELVE_DATA_SYMBOL
-        if asset == "EURUSD"
-        else asset
-    )
-
-    api_interval = (
-        TWELVE_DATA_INTERVAL
-        if timeframe == "15m"
-        else timeframe
-    )
+    symbol = normalize_asset(asset)
+    interval = normalize_interval(timeframe)
 
     params = {
-        "symbol": api_symbol,
-        "interval": api_interval,
+        "symbol": symbol,
+        "interval": interval,
         "outputsize": outputsize,
-        "apikey": key,
+        "apikey": api_key,
         "format": "JSON",
-        "order": "ASC",
     }
 
     try:
-
         response = requests.get(
-            url,
+            TWELVE_DATA_URL,
             params=params,
-            timeout=15,
+            timeout=20,
         )
-
-        payload = response.json()
 
     except requests.RequestException as exc:
-
         raise HTTPException(
             status_code=502,
-            detail=(
-                f"Erreur de connexion Twelve Data: "
-                f"{exc}"
-            ),
+            detail=f"Erreur de connexion à Twelve Data: {exc}",
         )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Twelve Data HTTP {response.status_code}: {response.text[:500]}",
+        )
+
+    try:
+        payload = response.json()
 
     except ValueError:
-
         raise HTTPException(
             status_code=502,
-            detail=(
-                "Twelve Data a retourne "
-                "une reponse JSON invalide."
-            ),
+            detail="Réponse Twelve Data invalide.",
         )
 
-    # Gestion explicite des erreurs Twelve Data
     if payload.get("status") == "error":
+        message = payload.get(
+            "message",
+            "Erreur inconnue Twelve Data.",
+        )
 
         raise HTTPException(
             status_code=502,
-            detail=(
-                f"Erreur Twelve Data "
-                f"{payload.get('code', '')}: "
-                f"{payload.get('message', 'Erreur inconnue')}"
-            ),
+            detail=f"Twelve Data: {message}",
         )
 
     values = payload.get("values")
 
     if not values:
-
         raise HTTPException(
             status_code=502,
-            detail=(
-                "Twelve Data n'a retourne "
-                "aucune bougie."
-            ),
+            detail="Twelve Data n'a retourné aucune bougie.",
         )
 
-    candles: List[Dict[str, float]] = []
+    rows: List[Dict[str, Any]] = []
 
-    for row in values:
-
+    for item in values:
         try:
-
-            candles.append(
+            rows.append(
                 {
-                    "open": float(row["open"]),
-                    "high": float(row["high"]),
-                    "low": float(row["low"]),
-                    "close": float(row["close"]),
-                    "volume": float(
-                        row.get("volume", 0) or 0
-                    ),
+                    "datetime": item.get("datetime"),
+                    "open": float(item["open"]),
+                    "high": float(item["high"]),
+                    "low": float(item["low"]),
+                    "close": float(item["close"]),
+                    "volume": float(item.get("volume", 0) or 0),
                 }
             )
-
-        except (
-            KeyError,
-            TypeError,
-            ValueError,
-        ):
-
+        except (KeyError, TypeError, ValueError):
             continue
 
-    if len(candles) < 30:
-
+    if len(rows) < MIN_CANDLES:
         raise HTTPException(
             status_code=502,
             detail=(
-                f"Nombre de bougies insuffisant: "
-                f"{len(candles)}"
+                f"Données insuffisantes: {len(rows)} bougies reçues. "
+                f"Minimum requis: {MIN_CANDLES}."
             ),
         )
 
-    return candles[-outputsize:]
+    df = pd.DataFrame(rows)
 
-
-# ============================================================
-# DATAFRAME
-# ============================================================
-
-def to_dataframe(
-    candles: List[Dict[str, float]]
-) -> pd.DataFrame:
-
-    df = pd.DataFrame(candles).copy()
-
-    for col in [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-    ]:
-
-        df[col] = pd.to_numeric(
-            df[col],
-            errors="coerce",
-        )
-
-    df = (
-        df.dropna(
-            subset=[
-                "open",
-                "high",
-                "low",
-                "close",
-            ]
-        )
-        .reset_index(drop=True)
+    df["datetime"] = pd.to_datetime(
+        df["datetime"],
+        errors="coerce",
     )
+
+    df = df.dropna(subset=["datetime"])
+
+    df = df.sort_values(
+        "datetime",
+        ascending=True,
+    ).reset_index(drop=True)
 
     return df
 
 
 # ============================================================
-# RSI
+# INDICATEURS
 # ============================================================
 
-def rsi(
+def calculate_ema(
+    series: pd.Series,
+    period: int,
+) -> pd.Series:
+
+    return series.ewm(
+        span=period,
+        adjust=False,
+    ).mean()
+
+
+def calculate_rsi(
     series: pd.Series,
     period: int = 14,
 ) -> pd.Series:
@@ -272,95 +259,63 @@ def rsi(
 
     avg_gain = gain.ewm(
         alpha=1 / period,
-        adjust=False,
         min_periods=period,
+        adjust=False,
     ).mean()
 
     avg_loss = loss.ewm(
         alpha=1 / period,
-        adjust=False,
         min_periods=period,
+        adjust=False,
     ).mean()
 
-    # Valeur neutre par défaut
-    result = pd.Series(
-        50.0,
-        index=series.index,
-        dtype=float,
-    )
+    rs = avg_gain / avg_loss.replace(0, np.nan)
 
-    # Marché fortement haussier
-    bullish = (
-        (avg_loss == 0)
-        & (avg_gain > 0)
-    )
+    rsi = 100 - (100 / (1 + rs))
 
-    result.loc[bullish] = 100.0
-
-    # Marché fortement baissier
-    bearish = (
-        (avg_gain == 0)
-        & (avg_loss > 0)
-    )
-
-    result.loc[bearish] = 0.0
-
-    # Cas normal
-    normal = (
-        (avg_gain > 0)
-        & (avg_loss > 0)
-    )
-
-    rs = (
-        avg_gain[normal]
-        / avg_loss[normal]
-    )
-
-    result.loc[normal] = (
-        100
-        - (
-            100
-            / (1 + rs)
-        )
-    )
-
-    return result
+    return rsi.fillna(50)
 
 
-# ============================================================
-# ATR
-# ============================================================
-
-def atr(
+def calculate_atr(
     df: pd.DataFrame,
     period: int = 14,
 ) -> pd.Series:
 
-    prev_close = df["close"].shift(1)
+    previous_close = df["close"].shift(1)
 
-    tr = pd.concat(
-        [
-            df["high"] - df["low"],
-            (
-                df["high"] - prev_close
-            ).abs(),
-            (
-                df["low"] - prev_close
-            ).abs(),
-        ],
+    tr1 = df["high"] - df["low"]
+    tr2 = (df["high"] - previous_close).abs()
+    tr3 = (df["low"] - previous_close).abs()
+
+    true_range = pd.concat(
+        [tr1, tr2, tr3],
         axis=1,
     ).max(axis=1)
 
-    return tr.ewm(
+    return true_range.ewm(
         alpha=1 / period,
-        adjust=False,
         min_periods=period,
+        adjust=False,
     ).mean()
 
 
-# ============================================================
-# INDICATEURS
-# ============================================================
+def calculate_macd(
+    series: pd.Series,
+) -> Dict[str, pd.Series]:
+
+    ema12 = calculate_ema(series, 12)
+    ema26 = calculate_ema(series, 26)
+
+    macd = ema12 - ema26
+    signal = calculate_ema(macd, 9)
+    histogram = macd - signal
+
+    return {
+        "macd": macd,
+        "signal": signal,
+        "histogram": histogram,
+    }
+
 
 def calculate_indicators(
     df: pd.DataFrame,
@@ -368,1502 +323,453 @@ def calculate_indicators(
 
     close = df["close"]
 
-    ema9 = close.ewm(
-        span=9,
-        adjust=False,
-    ).mean()
+    df["ema9"] = calculate_ema(close, 9)
+    df["ema21"] = calculate_ema(close, 21)
+    df["rsi14"] = calculate_rsi(close, 14)
+    df["momentum5"] = close.pct_change(5) * 100
+    df["atr14"] = calculate_atr(df, 14)
 
-    ema21 = close.ewm(
-        span=21,
-        adjust=False,
-    ).mean()
+    macd = calculate_macd(close)
 
-    rsi14 = rsi(
-        close,
-        14,
-    )
+    df["macd"] = macd["macd"]
+    df["macd_signal"] = macd["signal"]
+    df["macd_histogram"] = macd["histogram"]
 
-    atr14 = atr(
-        df,
-        14,
-    )
-
-    momentum_5 = (
-        close.iloc[-1]
-        - close.iloc[-6]
-    )
+    latest = df.iloc[-1]
 
     return {
-        "ema9": float(ema9.iloc[-1]),
-        "ema21": float(ema21.iloc[-1]),
-        "rsi14": float(rsi14.iloc[-1]),
-        "momentum_5": float(momentum_5),
-        "atr14": float(atr14.iloc[-1]),
+        "ema9": safe_float(latest["ema9"]) or 0.0,
+        "ema21": safe_float(latest["ema21"]) or 0.0,
+        "rsi14": safe_float(latest["rsi14"]) or 50.0,
+        "momentum_5": safe_float(latest["momentum5"]) or 0.0,
+        "atr14": safe_float(latest["atr14"]) or 0.0,
+        "macd": safe_float(latest["macd"]) or 0.0,
+        "macd_signal": safe_float(latest["macd_signal"]) or 0.0,
+        "macd_histogram": safe_float(latest["macd_histogram"]) or 0.0,
     }
 
 
 # ============================================================
-# CONTEXTE MARCHE
+# SCORE DE MARCHÉ
 # ============================================================
 
-def market_context(
-    df: pd.DataFrame,
+def calculate_market_score(
     indicators: Dict[str, float],
 ) -> Dict[str, Any]:
 
-    ranges = (
-        df["high"]
-        - df["low"]
-    )
+    ema9 = indicators["ema9"]
+    ema21 = indicators["ema21"]
+    rsi = indicators["rsi14"]
+    momentum = indicators["momentum_5"]
+    macd = indicators["macd"]
+    macd_signal = indicators["macd_signal"]
+    macd_histogram = indicators["macd_histogram"]
 
-    average_range = float(
-        ranges.tail(50).mean()
-    )
-
-    recent_average_range = float(
-        ranges.tail(10).mean()
-    )
-
-    volatility_ratio = (
-        recent_average_range
-        / average_range
-        if average_range > 0
-        else 1.0
-    )
-
-    last = df.iloc[-1]
-
-    direction = (
-        "BULLISH"
-        if last["close"] > last["open"]
-        else "BEARISH"
-        if last["close"] < last["open"]
-        else "NEUTRAL"
-    )
-
-    if (
-        volatility_ratio
-        < LOW_VOLATILITY_THRESHOLD
-    ):
-
-        volatility_state = "LOW"
-
-    elif (
-        volatility_ratio
-        > HIGH_VOLATILITY_THRESHOLD
-    ):
-
-        volatility_state = "HIGH"
-
-    else:
-
-        volatility_state = "NORMAL"
-
-    return {
-        "candle_direction": direction,
-        "average_range": average_range,
-        "recent_average_range": recent_average_range,
-        "volatility_ratio": volatility_ratio,
-        "volatility_state": volatility_state,
-    }
-
-
-# ============================================================
-# SUPPORT / RESISTANCE
-# ============================================================
-
-def levels(
-    df: pd.DataFrame,
-) -> Dict[str, float]:
-
-    window = df.tail(50)
-
-    return {
-        "support": float(
-            window["low"].min()
-        ),
-        "resistance": float(
-            window["high"].max()
-        ),
-    }
-
-
-# ============================================================
-# BLOC 1 — FILTRE SUPPORT / RESISTANCE
-# ============================================================
-
-def level_context(
-    close: float,
-    atr14: float,
-    lv: Dict[str, float],
-) -> Dict[str, Any]:
-
-    support = lv["support"]
-    resistance = lv["resistance"]
-
-    distance_to_support = max(
-        0.0,
-        close - support,
-    )
-
-    distance_to_resistance = max(
-        0.0,
-        resistance - close,
-    )
-
-    if atr14 > 0:
-
-        support_atr = (
-            distance_to_support
-            / atr14
-        )
-
-        resistance_atr = (
-            distance_to_resistance
-            / atr14
-        )
-
-    else:
-
-        support_atr = 0.0
-        resistance_atr = 0.0
-
-    # BUY dangereux si résistance trop proche
-    buy_blocked = (
-        atr14 > 0
-        and distance_to_resistance
-        <= LEVEL_BUFFER_ATR * atr14
-    )
-
-    # SELL dangereux si support trop proche
-    sell_blocked = (
-        atr14 > 0
-        and distance_to_support
-        <= LEVEL_BUFFER_ATR * atr14
-    )
-
-    if buy_blocked:
-
-        level_bias = "RESISTANCE_NEAR"
-
-    elif sell_blocked:
-
-        level_bias = "SUPPORT_NEAR"
-
-    else:
-
-        level_bias = "ROOM_AVAILABLE"
-
-    return {
-        "distance_to_support": distance_to_support,
-        "distance_to_resistance": distance_to_resistance,
-        "support_atr": support_atr,
-        "resistance_atr": resistance_atr,
-        "buy_blocked": buy_blocked,
-        "sell_blocked": sell_blocked,
-        "level_bias": level_bias,
-    }
-
-
-# ============================================================
-# BLOC 2 — CONFIRMATION RENFORCEE
-# ============================================================
-
-def confirmation_block(
-    df: pd.DataFrame,
-    ind: Dict[str, float],
-    market: Dict[str, Any],
-) -> Dict[str, Any]:
-
-    rsi14 = ind["rsi14"]
-    momentum = ind["momentum_5"]
-
-    confirmation_score = 0
+    score = 0
     reasons: List[str] = []
 
-    # RSI
-    if rsi14 >= 55:
-
-        confirmation_score += 1
-
-        reasons.append(
-            "RSI haussier"
-        )
-
-    elif rsi14 <= 45:
-
-        confirmation_score -= 1
-
-        reasons.append(
-            "RSI baissier"
-        )
-
-    else:
-
-        reasons.append(
-            "RSI neutre"
-        )
-
-    # Momentum
-    if momentum > 0:
-
-        confirmation_score += 1
-
-        reasons.append(
-            "Momentum positif"
-        )
-
-    elif momentum < 0:
-
-        confirmation_score -= 1
-
-        reasons.append(
-            "Momentum negatif"
-        )
-
-    else:
-
-        reasons.append(
-            "Momentum neutre"
-        )
-
-    # Dernière bougie
-    if (
-        market["candle_direction"]
-        == "BULLISH"
-    ):
-
-        confirmation_score += 1
-
-        reasons.append(
-            "Dernière bougie haussière"
-        )
-
-    elif (
-        market["candle_direction"]
-        == "BEARISH"
-    ):
-
-        confirmation_score -= 1
-
-        reasons.append(
-            "Dernière bougie baissière"
-        )
-
-    else:
-
-        reasons.append(
-            "Dernière bougie neutre"
-        )
-
-    return {
-        "score": int(
-            confirmation_score
-        ),
-        "reasons": reasons,
-    }
-
-
-# ============================================================
-# BLOC 3 — QUALITE DU SETUP
-# ============================================================
-
-def calculate_setup_quality(
-    signal: str,
-    trend_score: int,
-    confirmation_score: int,
-    ind: Dict[str, float],
-    market: Dict[str, Any],
-    level_ctx: Dict[str, Any],
-) -> Dict[str, Any]:
-
-    # Base
-    if signal == "WAIT":
-
-        quality = 35
-
-    else:
-
-        quality = 50
-
-    # --------------------------------------------------------
-    # Force de tendance
-    # --------------------------------------------------------
-
-    if abs(trend_score) == 2:
-
-        quality += 15
-
-    elif abs(trend_score) == 1:
-
-        quality += 7
-
-    # --------------------------------------------------------
-    # Confirmation
-    # --------------------------------------------------------
-
-    if abs(confirmation_score) == 3:
-
-        quality += 20
-
-    elif abs(confirmation_score) == 2:
-
-        quality += 12
-
-    elif abs(confirmation_score) == 1:
-
-        quality += 5
-
-    # --------------------------------------------------------
-    # Cohérence signal / confirmation
-    # --------------------------------------------------------
-
-    if signal == "BUY":
-
-        if confirmation_score >= 2:
-
-            quality += 10
-
-        elif confirmation_score <= -1:
-
-            quality -= 15
-
-    elif signal == "SELL":
-
-        if confirmation_score <= -2:
-
-            quality += 10
-
-        elif confirmation_score >= 1:
-
-            quality -= 15
-
-    # --------------------------------------------------------
-    # Volatilité
-    # --------------------------------------------------------
-
-    if (
-        market["volatility_state"]
-        == "NORMAL"
-    ):
-
-        quality += 5
-
-    elif (
-        market["volatility_state"]
-        == "HIGH"
-    ):
-
-        quality += 2
-
-    elif (
-        market["volatility_state"]
-        == "LOW"
-    ):
-
-        quality -= 8
-
-    # --------------------------------------------------------
-    # Espace devant le trade
-    # --------------------------------------------------------
-
-    if signal == "BUY":
-
-        room_atr = (
-            level_ctx["resistance_atr"]
-        )
-
-    elif signal == "SELL":
-
-        room_atr = (
-            level_ctx["support_atr"]
-        )
-
-    else:
-
-        room_atr = 0.0
-
-    if room_atr >= 2.0:
-
-        quality += 8
-
-    elif room_atr >= 1.0:
-
-        quality += 4
-
-    elif (
-        room_atr < 0.5
-        and signal != "WAIT"
-    ):
-
-        quality -= 15
-
-    # --------------------------------------------------------
-    # Blocage S/R
-    # --------------------------------------------------------
-
-    if (
-        signal == "BUY"
-        and level_ctx["buy_blocked"]
-    ):
-
-        quality -= 20
-
-    if (
-        signal == "SELL"
-        and level_ctx["sell_blocked"]
-    ):
-
-        quality -= 20
-
-    # Limites
-    quality = int(
-        max(
-            0,
-            min(
-                100,
-                quality,
-            ),
-        )
-    )
-
-    if quality >= 75:
-
-        state = "STRONG"
-
-    elif quality >= 55:
-
-        state = "MODERATE"
-
-    else:
-
-        state = "WEAK"
-
-    return {
-        "score": quality,
-        "state": state,
-    }
-
-
-# ============================================================
-# BLOC 4 — PLAN DE TRADE DYNAMIQUE
-# ============================================================
-
-def calculate_trade_plan(
-    df: pd.DataFrame,
-    signal: str,
-    atr14: float,
-    lv: Dict[str, float],
-) -> Dict[str, Optional[float]]:
-
-    entry = float(
-        df["close"].iloc[-1]
-    )
-
-    stop_loss: Optional[float] = None
-    take_profit: Optional[float] = None
-    risk_reward: Optional[float] = None
-    stop_distance: Optional[float] = None
-    target_distance: Optional[float] = None
-
-    if atr14 <= 0:
-
-        return {
-            "entry": entry,
-            "stop_loss": None,
-            "take_profit": None,
-            "risk_reward": None,
-            "stop_distance": None,
-            "target_distance": None,
-        }
-
-    recent = df.tail(20)
-
-    # ========================================================
-    # BUY
-    # ========================================================
-
-    if signal == "BUY":
-
-        structural_sl = float(
-            recent["low"].min()
-        )
-
-        atr_sl = (
-            entry
-            - (1.5 * atr14)
-        )
-
-        stop_loss = min(
-            structural_sl,
-            atr_sl,
-        )
-
-        stop_distance = (
-            entry
-            - stop_loss
-        )
-
-        if stop_distance <= 0:
-
-            return {
-                "entry": entry,
-                "stop_loss": None,
-                "take_profit": None,
-                "risk_reward": None,
-                "stop_distance": None,
-                "target_distance": None,
-            }
-
-        # Objectif standard = 2R
-        target_distance = (
-            stop_distance * 2.0
-        )
-
-        raw_take_profit = (
-            entry
-            + target_distance
-        )
-
-        # Résistance
-        resistance = lv["resistance"]
-
-        room = max(
-            0.0,
-            resistance - entry,
-        )
-
-        # Si résistance avant le TP standard,
-        # on adapte le TP à cette résistance.
-        if (
-            room > 0
-            and room < target_distance
-        ):
-
-            target_distance = room
-
-            take_profit = resistance
-
-            risk_reward = (
-                target_distance
-                / stop_distance
-            )
-
-        else:
-
-            take_profit = raw_take_profit
-
-            risk_reward = 2.0
-
-    # ========================================================
-    # SELL
-    # ========================================================
-
-    elif signal == "SELL":
-
-        structural_sl = float(
-            recent["high"].max()
-        )
-
-        atr_sl = (
-            entry
-            + (1.5 * atr14)
-        )
-
-        stop_loss = max(
-            structural_sl,
-            atr_sl,
-        )
-
-        stop_distance = (
-            stop_loss
-            - entry
-        )
-
-        if stop_distance <= 0:
-
-            return {
-                "entry": entry,
-                "stop_loss": None,
-                "take_profit": None,
-                "risk_reward": None,
-                "stop_distance": None,
-                "target_distance": None,
-            }
-
-        # Objectif standard = 2R
-        target_distance = (
-            stop_distance * 2.0
-        )
-
-        raw_take_profit = (
-            entry
-            - target_distance
-        )
-
-        # Support
-        support = lv["support"]
-
-        room = max(
-            0.0,
-            entry - support,
-        )
-
-        # Si support avant le TP standard,
-        # on adapte le TP à ce support.
-        if (
-            room > 0
-            and room < target_distance
-        ):
-
-            target_distance = room
-
-            take_profit = support
-
-            risk_reward = (
-                target_distance
-                / stop_distance
-            )
-
-        else:
-
-            take_profit = raw_take_profit
-
-            risk_reward = 2.0
-
-    # ========================================================
-    # VALIDATION RR
-    # ========================================================
-
-    if (
-        risk_reward is not None
-        and risk_reward < MIN_RR
-    ):
-
-        stop_loss = None
-        take_profit = None
-        risk_reward = None
-        stop_distance = None
-        target_distance = None
-
-    return {
-        "entry": entry,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "risk_reward": risk_reward,
-        "stop_distance": stop_distance,
-        "target_distance": target_distance,
-    }
-
-
-# ============================================================
-# MOTEUR DE DECISION — 4 BLOCS
-# ============================================================
-
-def decision_engine(
-    df: pd.DataFrame,
-    ind: Dict[str, float],
-    market: Dict[str, Any],
-    lv: Dict[str, float],
-) -> Dict[str, Any]:
-
-    """
-    4 blocs :
-
-    BLOC 1 : Tendance + Support/Resistance
-    BLOC 2 : Confirmation multi-indicateurs
-    BLOC 3 : Qualité du setup + signal
-    BLOC 4 : Plan de trade dynamique
-    """
-
-    close = float(
-        df["close"].iloc[-1]
-    )
-
-    ema9 = ind["ema9"]
-    ema21 = ind["ema21"]
-
-    # ========================================================
-    # BLOC 1 — FILTRE DE TENDANCE
-    # ========================================================
-
-    trend_score = 0
-
-    trend_reasons: List[str] = []
-
-    # EMA9 / EMA21
     if ema9 > ema21:
-
-        trend_score += 1
-
-        trend_reasons.append(
-            "EMA9 au-dessus de EMA21"
-        )
-
+        score += 2
+        reasons.append("EMA9 > EMA21")
     elif ema9 < ema21:
+        score -= 2
+        reasons.append("EMA9 < EMA21")
 
-        trend_score -= 1
+    if 52 <= rsi <= 70:
+        score += 1
+        reasons.append("RSI favorable aux acheteurs")
+    elif 30 <= rsi <= 48:
+        score -= 1
+        reasons.append("RSI favorable aux vendeurs")
+    elif rsi > 70:
+        score -= 1
+        reasons.append("RSI en zone de surachat")
+    elif rsi < 30:
+        score += 1
+        reasons.append("RSI en zone de survente")
 
-        trend_reasons.append(
-            "EMA9 sous EMA21"
-        )
+    if momentum > 0:
+        score += 1
+        reasons.append("Momentum positif")
+    elif momentum < 0:
+        score -= 1
+        reasons.append("Momentum négatif")
 
-    else:
-
-        trend_reasons.append(
-            "EMA9 et EMA21 proches"
-        )
-
-    # Prix / EMA9
-    if close > ema9:
-
-        trend_score += 1
-
-        trend_reasons.append(
-            "Prix au-dessus de EMA9"
-        )
-
-    elif close < ema9:
-
-        trend_score -= 1
-
-        trend_reasons.append(
-            "Prix sous EMA9"
-        )
-
-    else:
-
-        trend_reasons.append(
-            "Prix proche de EMA9"
-        )
-
-    trend = (
-        "BULLISH"
-        if trend_score >= 2
-        else "BEARISH"
-        if trend_score <= -2
-        else "NEUTRAL"
-    )
-
-    # ========================================================
-    # BLOC 2 — CONFIRMATION
-    # ========================================================
-
-    confirmation = confirmation_block(
-        df,
-        ind,
-        market,
-    )
-
-    confirmation_score = (
-        confirmation["score"]
-    )
-
-    confirmation_reasons = (
-        confirmation["reasons"]
-    )
-
-    # IMPORTANT :
-    # On conserve le calcul de score validé en 4.0.1 :
-    #
-    # tendance = 2 points maximum
-    # confirmation = 3 points maximum
-    #
-    # Total = -5 à +5
-    score = (
-        trend_score
-        + confirmation_score
-    )
-
-    # ========================================================
-    # SUPPORT / RESISTANCE
-    # ========================================================
-
-    level_ctx = level_context(
-        close,
-        ind["atr14"],
-        lv,
-    )
-
-    # BUY bloqué si résistance trop proche
-    if (
-        score >= 3
-        and level_ctx["buy_blocked"]
-    ):
-
-        score = 2
-
-        confirmation_reasons.append(
-            "BUY bloque: resistance trop proche"
-        )
-
-    # SELL bloqué si support trop proche
-    if (
-        score <= -3
-        and level_ctx["sell_blocked"]
-    ):
-
-        score = -2
-
-        confirmation_reasons.append(
-            "SELL bloque: support trop proche"
-        )
-
-    # ========================================================
-    # FILTRE DE VOLATILITE
-    # ========================================================
-
-    if (
-        market["volatility_state"]
-        == "LOW"
-        and abs(score) >= 3
-    ):
-
-        score = int(
-            np.sign(score) * 2
-        )
-
-        confirmation_reasons.append(
-            "Filtre de volatilite: "
-            "conviction reduite"
-        )
-
-    # ========================================================
-    # SIGNAL
-    # ========================================================
+    if macd > macd_signal and macd_histogram > 0:
+        score += 1
+        reasons.append("MACD haussier")
+    elif macd < macd_signal and macd_histogram < 0:
+        score -= 1
+        reasons.append("MACD baissier")
 
     if score >= 3:
-
-        signal = "BUY"
-
+        trend = "BULLISH"
     elif score <= -3:
-
-        signal = "SELL"
-
+        trend = "BEARISH"
     else:
+        trend = "NEUTRAL"
 
+    if score >= 4:
+        signal = "BUY"
+    elif score <= -4:
+        signal = "SELL"
+    else:
         signal = "WAIT"
 
-    # ========================================================
-    # CONFIDENCE
-    # ========================================================
-
-    confidence = (
-        50
-        + abs(score) * 8
-    )
-
-    if signal == "WAIT":
-
-        confidence = (
-            50
-            + min(
-                abs(score) * 8,
-                16,
-            )
-        )
-
     confidence = int(
-        min(
-            95,
-            max(
-                50,
-                confidence,
+        max(
+            50,
+            min(
+                95,
+                50 + abs(score) * 8,
             ),
         )
     )
 
-    # ========================================================
-    # BLOC 3 — QUALITE DU SETUP
-    # ========================================================
-
-    quality = calculate_setup_quality(
-        signal=signal,
-        trend_score=trend_score,
-        confirmation_score=confirmation_score,
-        ind=ind,
-        market=market,
-        level_ctx=level_ctx,
-    )
-
-    # ========================================================
-    # BLOC 4 — PLAN DE TRADE
-    # ========================================================
-
-    plan = calculate_trade_plan(
-        df=df,
-        signal=signal,
-        atr14=ind["atr14"],
-        lv=lv,
-    )
-
-    # ========================================================
-    # VALIDATION FINALE DU PLAN
-    # ========================================================
-
-    if (
-        signal in ("BUY", "SELL")
-        and plan["risk_reward"] is None
-    ):
-
-        confirmation_reasons.append(
-            "Plan annule: espace ou "
-            "ratio risque/rendement insuffisant"
-        )
-
-        signal = "WAIT"
-
-        confidence = min(
-            confidence,
-            66,
-        )
-
-        plan = calculate_trade_plan(
-            df=df,
-            signal="WAIT",
-            atr14=ind["atr14"],
-            lv=lv,
-        )
-
-    # ========================================================
-    # VOLATILITE DANS LES RAISONS
-    # ========================================================
-
-    if (
-        market["volatility_state"]
-        == "LOW"
-    ):
-
-        confirmation_reasons.append(
-            "Volatilite faible"
-        )
-
-    elif (
-        market["volatility_state"]
-        == "HIGH"
-    ):
-
-        confirmation_reasons.append(
-            "Volatilite elevee"
-        )
-
-    # ========================================================
-    # RESULTAT DU MOTEUR
-    # ========================================================
+    if abs(score) >= 5:
+        setup_state = "STRONG"
+        setup_score = 90
+    elif abs(score) >= 4:
+        setup_state = "GOOD"
+        setup_score = 75
+    elif abs(score) >= 2:
+        setup_state = "MODERATE"
+        setup_score = 60
+    else:
+        setup_state = "WEAK"
+        setup_score = 40
 
     return {
-        "trend": trend,
-        "score": int(score),
+        "score": score,
         "signal": signal,
         "confidence": confidence,
-
-        "setup_quality": quality,
-
-        "trend_score": int(
-            trend_score
-        ),
-
-        "confirmation_score": int(
-            confirmation_score
-        ),
-
-        "level_context": level_ctx,
-
-        "reasons": (
-            trend_reasons
-            + confirmation_reasons
-        ),
-
-        "trade_plan": plan,
+        "trend": trend,
+        "reasons": reasons,
+        "setup_quality": {
+            "score": setup_score,
+            "state": setup_state,
+        },
     }
 
 
 # ============================================================
-# ANALYSE
+# TRADE PLAN
 # ============================================================
 
-def analyze_candles(
-    candles: List[Dict[str, float]],
-    asset: str,
-    timeframe: str,
+def build_trade_plan(
+    signal: str,
+    price: float,
+    atr: float,
+) -> Optional[Dict[str, Any]]:
+
+    if signal not in ["BUY", "SELL"]:
+        return None
+
+    if atr <= 0:
+        return None
+
+    stop_distance = atr * 1.5
+    tp1_distance = stop_distance * 1.5
+    tp2_distance = stop_distance * 2.5
+
+    if signal == "BUY":
+        stop_loss = price - stop_distance
+        take_profit_1 = price + tp1_distance
+        take_profit_2 = price + tp2_distance
+    else:
+        stop_loss = price + stop_distance
+        take_profit_1 = price - tp1_distance
+        take_profit_2 = price - tp2_distance
+
+    risk = abs(price - stop_loss)
+    reward_1 = abs(take_profit_1 - price)
+    reward_2 = abs(take_profit_2 - price)
+
+    rr1 = reward_1 / risk if risk else 0
+    rr2 = reward_2 / risk if risk else 0
+
+    return {
+        "direction": signal,
+        "entry": round(price, 5),
+        "stop_loss": round(stop_loss, 5),
+        "take_profit_1": round(take_profit_1, 5),
+        "take_profit_2": round(take_profit_2, 5),
+        "risk_distance": round(risk, 5),
+        "rr_tp1": round(rr1, 2),
+        "rr_tp2": round(rr2, 2),
+        "method": "ATR",
+    }
+
+
+# ============================================================
+# BOUGIES
+# ============================================================
+
+def dataframe_to_candles(
+    df: pd.DataFrame,
+    limit: int = 25,
+) -> List[Dict[str, Any]]:
+
+    result = []
+
+    for _, row in df.tail(limit).iterrows():
+        result.append(
+            {
+                "datetime": row["datetime"].isoformat(),
+                "open": round(float(row["open"]), 6),
+                "high": round(float(row["high"]), 6),
+                "low": round(float(row["low"]), 6),
+                "close": round(float(row["close"]), 6),
+                "volume": round(float(row["volume"]), 2),
+            }
+        )
+
+    return result
+
+
+# ============================================================
+# ANALYSE PRINCIPALE
+# ============================================================
+
+def run_analysis(
+    asset: str = ASSET,
+    timeframe: str = TIMEFRAME,
+    candles: int = DEFAULT_CANDLES,
 ) -> Dict[str, Any]:
 
-    if len(candles) < 30:
-
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "Au moins 30 bougies "
-                "sont necessaires."
-            ),
-        )
-
-    df = to_dataframe(
-        candles
+    df = fetch_candles(
+        asset=asset,
+        timeframe=timeframe,
+        outputsize=candles,
     )
 
-    if len(df) < 30:
+    indicators = calculate_indicators(df)
+    market = calculate_market_score(indicators)
 
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "Bougies invalides "
-                "ou insuffisantes."
-            ),
-        )
+    price = safe_float(df.iloc[-1]["close"]) or 0.0
+    atr = indicators["atr14"]
 
-    # --------------------------------------------------------
-    # Calculs
-    # --------------------------------------------------------
-
-    ind = calculate_indicators(
-        df
+    trade_plan = build_trade_plan(
+        signal=market["signal"],
+        price=price,
+        atr=atr,
     )
 
-    market = market_context(
-        df,
-        ind,
-    )
-
-    lv = levels(
-        df
-    )
-
-    decision = decision_engine(
-        df,
-        ind,
-        market,
-        lv,
-    )
-
-    # --------------------------------------------------------
-    # Réponse
-    # --------------------------------------------------------
+    latest_time = df.iloc[-1]["datetime"]
 
     return {
         "status": "success",
-
         "engine_version": APP_VERSION,
-
-        "asset": asset,
-
+        "source": "Twelve Data",
+        "asset": asset.upper(),
+        "symbol": normalize_asset(asset),
         "timeframe": timeframe,
-
-        "price": float(
-            df["close"].iloc[-1]
-        ),
-
-        "signal": decision[
-            "signal"
-        ],
-
-        "confidence": decision[
-            "confidence"
-        ],
-
-        "score": decision[
-            "score"
-        ],
-
-        "trend": decision[
-            "trend"
-        ],
-
-        # ====================================================
-        # NOUVEAU 4.1
-        # ====================================================
-
-        "setup_quality": decision[
-            "setup_quality"
-        ],
-
-        "scores": {
-            "trend": decision[
-                "trend_score"
-            ],
-
-            "confirmation": decision[
-                "confirmation_score"
-            ],
-
-            "total": decision[
-                "score"
-            ],
-        },
-
-        # ====================================================
-        # INDICATEURS
-        # ====================================================
-
+        "price": round(price, 6),
+        "signal": market["signal"],
+        "confidence": market["confidence"],
+        "score": market["score"],
+        "trend": market["trend"],
+        "setup_quality": market["setup_quality"],
         "indicators": {
-            k: round(
-                v,
-                8,
-            )
-            for k, v in ind.items()
+            "ema9": round(indicators["ema9"], 6),
+            "ema21": round(indicators["ema21"], 6),
+            "rsi14": round(indicators["rsi14"], 2),
+            "momentum_5": round(indicators["momentum_5"], 4),
+            "atr14": round(indicators["atr14"], 6),
+            "macd": round(indicators["macd"], 6),
+            "macd_signal": round(indicators["macd_signal"], 6),
+            "macd_histogram": round(indicators["macd_histogram"], 6),
         },
-
-        # ====================================================
-        # MARCHE
-        # ====================================================
-
-        "market": {
-            "candle_direction": market[
-                "candle_direction"
-            ],
-
-            "average_range": round(
-                market[
-                    "average_range"
-                ],
-                8,
+        "scores": {
+            "ema": (
+                2
+                if indicators["ema9"] > indicators["ema21"]
+                else -2
+                if indicators["ema9"] < indicators["ema21"]
+                else 0
             ),
-
-            "recent_average_range": round(
-                market[
-                    "recent_average_range"
-                ],
-                8,
+            "rsi": (
+                1
+                if 52 <= indicators["rsi14"] <= 70
+                else -1
+                if 30 <= indicators["rsi14"] <= 48
+                else 0
             ),
-
-            "volatility_ratio": round(
-                market[
-                    "volatility_ratio"
-                ],
-                3,
+            "momentum": (
+                1
+                if indicators["momentum_5"] > 0
+                else -1
+                if indicators["momentum_5"] < 0
+                else 0
             ),
-
-            "volatility_state": market[
-                "volatility_state"
-            ],
-        },
-
-        # ====================================================
-        # SUPPORT / RESISTANCE
-        # ====================================================
-
-        "levels": {
-            k: round(
-                v,
-                8,
-            )
-            for k, v in lv.items()
-        },
-
-        "level_context": {
-            "distance_to_support": round(
-                decision[
-                    "level_context"
-                ][
-                    "distance_to_support"
-                ],
-                8,
-            ),
-
-            "distance_to_resistance": round(
-                decision[
-                    "level_context"
-                ][
-                    "distance_to_resistance"
-                ],
-                8,
-            ),
-
-            "support_atr": round(
-                decision[
-                    "level_context"
-                ][
-                    "support_atr"
-                ],
-                3,
-            ),
-
-            "resistance_atr": round(
-                decision[
-                    "level_context"
-                ][
-                    "resistance_atr"
-                ],
-                3,
-            ),
-
-            "buy_blocked": decision[
-                "level_context"
-            ][
-                "buy_blocked"
-            ],
-
-            "sell_blocked": decision[
-                "level_context"
-            ][
-                "sell_blocked"
-            ],
-
-            "level_bias": decision[
-                "level_context"
-            ][
-                "level_bias"
-            ],
-        },
-
-        # ====================================================
-        # PLAN DE TRADE
-        # ====================================================
-
-        "trade_plan": {
-            k: (
-                None
-                if v is None
-                else round(
-                    float(v),
-                    8,
+            "macd": (
+                1
+                if (
+                    indicators["macd"] > indicators["macd_signal"]
+                    and indicators["macd_histogram"] > 0
                 )
-            )
-            for k, v in decision[
-                "trade_plan"
-            ].items()
+                else -1
+                if (
+                    indicators["macd"] < indicators["macd_signal"]
+                    and indicators["macd_histogram"] < 0
+                )
+                else 0
+            ),
         },
-
-        # ====================================================
-        # RAISONS
-        # ====================================================
-
-        "reasons": decision[
-            "reasons"
-        ],
-
-        # ====================================================
-        # BOUGIES
-        # ====================================================
-
-        "candles_count": len(df),
-
-        "candles": (
-            df[
-                [
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                ]
-            ]
-            .round(8)
-            .to_dict(
-                orient="records"
-            )
-        ),
+        "reasons": market["reasons"],
+        "trade_plan": trade_plan,
+        "data": {
+            "candles_count": len(df),
+            "last_candle": latest_time.isoformat(),
+        },
     }
 
 
 # ============================================================
-# ROUTE RACINE
+# ENDPOINTS
 # ============================================================
 
 @app.get("/")
-def root() -> Dict[str, str]:
-
+def root() -> Dict[str, Any]:
     return {
-        "name": "Pocket AI Trader",
-        "version": APP_VERSION,
         "status": "online",
-        "engine": "4-bloc decision engine v4.1",
-    }
-
-
-# ============================================================
-# MARKET DATA
-# ============================================================
-
-@app.get("/market-data")
-def market_data() -> Dict[str, Any]:
-
-    candles = fetch_candles()
-
-    return {
-        "status": "success",
-        "source": "Twelve Data",
+        "service": "Pocket AI Trader",
+        "engine_version": APP_VERSION,
         "asset": ASSET,
         "timeframe": TIMEFRAME,
-        "candles_count": len(candles),
-        "candles": candles,
     }
 
 
-# ============================================================
-# ANALYSE LIVE
-# ============================================================
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {
+        "status": "healthy",
+        "engine_version": APP_VERSION,
+        "asset": ASSET,
+        "timeframe": TIMEFRAME,
+        "twelve_data_configured": bool(
+            os.getenv("TWELVE_DATA_API_KEY")
+        ),
+    }
 
-@app.get("/analyze-live")
-def analyze_live() -> Dict[str, Any]:
-
-    candles = fetch_candles()
-
-    return analyze_candles(
-        candles,
-        ASSET,
-        TIMEFRAME,
-    )
-
-
-# ============================================================
-# ANALYSE MANUELLE
-# ============================================================
 
 @app.post("/analyze")
 def analyze(
     request: AnalyzeRequest,
 ) -> Dict[str, Any]:
 
-    
-# ============================================================
-# TEST TRADE PLAN — BUY / SELL
-# ============================================================
-
-def test_trade_plan(
-    forced_signal: str,
-) -> Dict[str, Any]:
-
-    candles = fetch_candles(
-        ASSET,
-        TIMEFRAME,
-        CANDLE_LIMIT,
+    return run_analysis(
+        asset=request.asset,
+        timeframe=request.timeframe,
+        candles=request.candles,
     )
 
-    df = to_dataframe(candles)
 
-    if len(df) < 30:
-        raise HTTPException(
-            status_code=422,
-            detail="Nombre de bougies insuffisant pour le test."
-        )
+@app.get("/analyze")
+def analyze_get(
+    asset: str = ASSET,
+    timeframe: str = TIMEFRAME,
+    candles: int = DEFAULT_CANDLES,
+) -> Dict[str, Any]:
 
-    # Calcul des indicateurs réels
-    ind = calculate_indicators(df)
+    candles = max(
+        MIN_CANDLES,
+        min(MAX_CANDLES, candles),
+    )
 
-    # Niveaux réels
-    lv = levels(df)
+    return run_analysis(
+        asset=asset,
+        timeframe=timeframe,
+        candles=candles,
+    )
 
-    # Plan forcé uniquement pour tester le moteur SL/TP
-    trade_plan = calculate_trade_plan(
-        df=df,
-        signal=forced_signal,
-        atr14=ind["atr14"],
-        lv=lv,
+
+@app.get("/quick-analysis")
+def quick_analysis() -> Dict[str, Any]:
+
+    result = run_analysis(
+        asset=ASSET,
+        timeframe=TIMEFRAME,
+        candles=DEFAULT_CANDLES,
+    )
+
+    return {
+        "status": result["status"],
+        "engine_version": result["engine_version"],
+        "asset": result["asset"],
+        "timeframe": result["timeframe"],
+        "price": result["price"],
+        "signal": result["signal"],
+        "confidence": result["confidence"],
+        "score": result["score"],
+        "trend": result["trend"],
+        "setup_quality": result["setup_quality"],
+        "trade_plan": result["trade_plan"],
+    }
+
+
+@app.get("/candles")
+def candles(
+    asset: str = ASSET,
+    timeframe: str = TIMEFRAME,
+    limit: int = 25,
+) -> Dict[str, Any]:
+
+    limit = max(
+        1,
+        min(MAX_CANDLES, limit),
+    )
+
+    df = fetch_candles(
+        asset=asset,
+        timeframe=timeframe,
+        outputsize=max(DEFAULT_CANDLES, limit),
+    )
+
+    result = dataframe_to_candles(
+        df,
+        limit,
     )
 
     return {
         "status": "success",
+        "source": "Twelve Data",
+        "asset": asset.upper(),
+        "timeframe": timeframe,
+        "candles_count": len(result),
+        "candles": result,
+    }
+
+
+@app.get("/version")
+def version() -> Dict[str, Any]:
+
+    return {
         "engine_version": APP_VERSION,
-        "test_mode": True,
-        "test_type": forced_signal,
         "asset": ASSET,
         "timeframe": TIMEFRAME,
-
-        "price": float(
-            df["close"].iloc[-1]
-        ),
-
-        "signal": forced_signal,
-
-        "indicators": {
-            "ema9": round(
-                ind["ema9"],
-                8,
-            ),
-            "ema21": round(
-                ind["ema21"],
-                8,
-            ),
-            "rsi14": round(
-                ind["rsi14"],
-                8,
-            ),
-            "momentum_5": round(
-                ind["momentum_5"],
-                8,
-            ),
-            "atr14": round(
-                ind["atr14"],
-                8,
-            ),
-        },
-
-        "levels": {
-            "support": round(
-                lv["support"],
-                8,
-            ),
-            "resistance": round(
-                lv["resistance"],
-                8,
-            ),
-        },
-
-        "trade_plan": {
-            k: (
-                None
-                if v is None
-                else round(
-                    float(v),
-                    8,
-                )
-            )
-            for k, v in trade_plan.items()
-        },
-
-        "validation": {
-            "entry_valid": (
-                trade_plan["entry"] is not None
-            ),
-
-            "stop_loss_valid": (
-                trade_plan["stop_loss"] is not None
-            ),
-
-            "take_profit_valid": (
-                trade_plan["take_profit"] is not None
-            ),
-
-            "risk_reward_valid": (
-                trade_plan["risk_reward"] is not None
-                and trade_plan["risk_reward"] >= MIN_RR
-            ),
-
-            "trade_plan_valid": (
-                trade_plan["entry"] is not None
-                and trade_plan["stop_loss"] is not None
-                and trade_plan["take_profit"] is not None
-                and trade_plan["risk_reward"] is not None
-                and trade_plan["risk_reward"] >= MIN_RR
-            ),
-        },
+        "source": "Twelve Data",
     }
 
 
 # ============================================================
-# TEST BUY
+# LANCEMENT LOCAL
 # ============================================================
 
-@app.get("/test/buy")
-def test_buy() -> Dict[str, Any]:
+if __name__ == "__main__":
+    import uvicorn
 
-    return test_trade_plan("BUY")
-
-
-# ============================================================
-# TEST SELL
-# ============================================================
-
-@app.get("/test/sell")
-def test_sell() -> Dict[str, Any]:
-
-    return test_trade_plan("SELL")
-
-    return analyze_candles(
-        [
-            c.model_dump()
-            for c in request.candles
-        ],
-        request.asset,
-        request.timeframe,
+    port = int(
+        os.getenv(
+            "PORT",
+            "8000",
+        )
     )
+
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,
+)
+    
