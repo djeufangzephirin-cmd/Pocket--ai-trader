@@ -517,20 +517,33 @@ else:
         "RSI neutre"
     )
 
-    # --------------------------------------------------------
-    # MOMENTUM
-    # --------------------------------------------------------
+# ---------------------------------------------
+# MOMENTUM
+# ---------------------------------------------
 
-    if momentum > 0:
-        score += 1
-        reasons.append("Momentum positif")
+if abs(momentum) < 0.03:
+    momentum_signal = 0
+    reasons.append("Momentum faible")
 
-    elif momentum < 0:
-        score -= 1
-        reasons.append("Momentum négatif")
+elif 0.03 <= momentum < 0.15:
+    momentum_signal = 1
+    score += 1
+    reasons.append("Momentum haussier modéré")
 
-    else:
-        reasons.append("Momentum neutre")
+elif -0.15 < momentum <= -0.03:
+    momentum_signal = -1
+    score -= 1
+    reasons.append("Momentum baissier modéré")
+
+elif momentum >= 0.15:
+    momentum_signal = 2
+    score += 2
+    reasons.append("Momentum haussier fort")
+
+elif momentum <= -0.15:
+    momentum_signal = -2
+    score -= 2
+    reasons.append("Momentum baissier fort")
 
     # --------------------------------------------------------
     # MACD
