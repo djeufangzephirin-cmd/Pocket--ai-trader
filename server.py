@@ -492,30 +492,31 @@ def calculate_market_score(
         score -= 2
         reasons.append("EMA9 < EMA21")
 
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
+# ------------------------------
+# RSI
+# ------------------------------
 
-    elif 30 < rsi <= 45:
+if 55 <= rsi < 70:
+    rsi_signal = 1
+    score += 1
+    reasons.append("RSI confirme une pression haussière")
+
+elif 30 < rsi <= 45:
+    rsi_signal = -1
     score -= 1
-    reasons.append(
-        "RSI confirme une pression baissière"
-    )
+    reasons.append("RSI confirme une pression baissière")
 
 elif rsi >= 70:
-    reasons.append(
-        "RSI en surachat - risque de correction"
-    )
+    rsi_signal = 0
+    reasons.append("RSI en surachat - risque de correction")
 
 elif rsi <= 30:
-    reasons.append(
-        "RSI en survente - risque de rebond"
-    )
+    rsi_signal = 0
+    reasons.append("RSI en survente - risque de rebond")
 
 else:
-    reasons.append(
-        "RSI neutre"
-    )
+    rsi_signal = 0
+    reasons.append("RSI neutre")
 
 # ---------------------------------------------
 # MOMENTUM
