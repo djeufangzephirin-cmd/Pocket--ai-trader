@@ -1059,7 +1059,7 @@ def build_risk_management(
 def dataframe_to_candles(
     df: pd.DataFrame,
     limit: int = 25,
-) -> List[Dict[str, Any]] = []
+) -> List[Dict[str, Any]]:
 
     for _, row in df.tail(
         limit
