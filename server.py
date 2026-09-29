@@ -6,7 +6,7 @@ import pandas as pd
 import requests
 
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMid[dleware
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
