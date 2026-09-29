@@ -496,32 +496,26 @@ def calculate_market_score(
     # RSI
     # --------------------------------------------------------
 
-    if 52 <= rsi <= 70:
-        score += 1
-        reasons.append(
-            "RSI favorable aux acheteurs"
-        )
+    elif 30 < rsi <= 45:
+    score -= 1
+    reasons.append(
+        "RSI confirme une pression baissière"
+    )
 
-    elif 30 <= rsi <= 48:
-        score -= 1
-        reasons.append(
-            "RSI favorable aux vendeurs"
-        )
+elif rsi >= 70:
+    reasons.append(
+        "RSI en surachat - risque de correction"
+    )
 
-    elif rsi > 70:
-        score -= 1
-        reasons.append(
-            "RSI en zone de surachat"
-        )
+elif rsi <= 30:
+    reasons.append(
+        "RSI en survente - risque de rebond"
+    )
 
-    elif rsi < 30:
-        score += 1
-        reasons.append(
-            "RSI en zone de survente"
-        )
-
-    else:
-        reasons.append("RSI neutre")
+else:
+    reasons.append(
+        "RSI neutre"
+    )
 
     # --------------------------------------------------------
     # MOMENTUM
