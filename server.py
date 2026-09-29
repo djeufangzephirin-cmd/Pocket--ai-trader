@@ -25,6 +25,23 @@ DEFAULT_CANDLES = 100
 MIN_CANDLES = 30
 MAX_CANDLES = 500
 
+# ============================================================
+# RISK MANAGEMENT CONFIGURATION
+# ============================================================
+
+DEFAULT_ACCOUNT_BALANCE = 1000.0
+DEFAULT_RISK_PERCENT = 1.0
+
+# EURUSD
+PIP_SIZE_EURUSD = 0.0001
+PIP_VALUE_PER_STANDARD_LOT = 10.0
+
+MIN_RISK_PERCENT = 0.1
+MAX_RISK_PERCENT = 2.0
+
+MIN_RR_TP1 = 1.0
+MIN_RR_TP2 = 1.5
+
 
 # ============================================================
 # FASTAPI
@@ -52,10 +69,22 @@ app.add_middleware(
 class AnalyzeRequest(BaseModel):
     asset: str = Field(default=ASSET)
     timeframe: str = Field(default=TIMEFRAME)
+
     candles: int = Field(
         default=DEFAULT_CANDLES,
         ge=MIN_CANDLES,
         le=MAX_CANDLES,
+    )
+
+    account_balance: float = Field(
+        default=DEFAULT_ACCOUNT_BALANCE,
+        gt=0,
+    )
+
+    risk_percent: float = Field(
+        default=DEFAULT_RISK_PERCENT,
+        gt=0,
+        le=MAX_RISK_PERCENT,
     )
 
 
@@ -112,6 +141,7 @@ def safe_float(value: Any) -> Optional[float]:
 # ============================================================
 
 def get_api_key() -> str:
+
     api_key = os.getenv("TWELVE_DATA_API_KEY")
 
     if not api_key:
@@ -146,6 +176,7 @@ def fetch_candles(
     }
 
     try:
+
         response = requests.get(
             TWELVE_DATA_URL,
             params=params,
@@ -153,12 +184,16 @@ def fetch_candles(
         )
 
     except requests.RequestException as exc:
+
         raise HTTPException(
             status_code=502,
-            detail=f"Erreur de connexion à Twelve Data: {exc}",
+            detail=(
+                f"Erreur de connexion à Twelve Data: {exc}"
+            ),
         )
 
     if response.status_code != 200:
+
         raise HTTPException(
             status_code=502,
             detail=(
@@ -169,15 +204,18 @@ def fetch_candles(
         )
 
     try:
+
         payload = response.json()
 
     except ValueError:
+
         raise HTTPException(
             status_code=502,
             detail="Réponse Twelve Data invalide.",
         )
 
     if payload.get("status") == "error":
+
         message = payload.get(
             "message",
             "Erreur inconnue Twelve Data.",
@@ -191,6 +229,7 @@ def fetch_candles(
     values = payload.get("values")
 
     if not values:
+
         raise HTTPException(
             status_code=502,
             detail="Twelve Data n'a retourné aucune bougie.",
@@ -199,7 +238,9 @@ def fetch_candles(
     rows: List[Dict[str, Any]] = []
 
     for item in values:
+
         try:
+
             rows.append(
                 {
                     "datetime": item.get("datetime"),
@@ -213,10 +254,15 @@ def fetch_candles(
                 }
             )
 
-        except (KeyError, TypeError, ValueError):
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+        ):
             continue
 
     if len(rows) < MIN_CANDLES:
+
         raise HTTPException(
             status_code=502,
             detail=(
@@ -301,14 +347,19 @@ def calculate_atr(
 
     previous_close = df["close"].shift(1)
 
-    tr1 = df["high"] - df["low"]
+    tr1 = (
+        df["high"]
+        - df["low"]
+    )
 
     tr2 = (
-        df["high"] - previous_close
+        df["high"]
+        - previous_close
     ).abs()
 
     tr3 = (
-        df["low"] - previous_close
+        df["low"]
+        - previous_close
     ).abs()
 
     true_range = pd.concat(
@@ -438,8 +489,10 @@ def calculate_market_score(
 
     ema9 = indicators["ema9"]
     ema21 = indicators["ema21"]
+
     rsi = indicators["rsi14"]
     momentum = indicators["momentum_5"]
+
     macd = indicators["macd"]
     macd_signal = indicators["macd_signal"]
     macd_histogram = indicators["macd_histogram"]
@@ -448,63 +501,93 @@ def calculate_market_score(
 
     reasons: List[str] = []
 
+    # --------------------------------------------------------
     # EMA
+    # --------------------------------------------------------
+
     if ema9 > ema21:
+
         score += 2
+
         reasons.append(
             "EMA9 > EMA21"
         )
 
     elif ema9 < ema21:
+
         score -= 2
+
         reasons.append(
             "EMA9 < EMA21"
         )
 
+    # --------------------------------------------------------
     # RSI
+    # --------------------------------------------------------
+
     if 52 <= rsi <= 70:
+
         score += 1
+
         reasons.append(
             "RSI favorable aux acheteurs"
         )
 
     elif 30 <= rsi <= 48:
+
         score -= 1
+
         reasons.append(
             "RSI favorable aux vendeurs"
         )
 
     elif rsi > 70:
+
         score -= 1
+
         reasons.append(
             "RSI en zone de surachat"
         )
 
     elif rsi < 30:
+
         score += 1
+
         reasons.append(
             "RSI en zone de survente"
         )
 
-    # Momentum
+    # --------------------------------------------------------
+    # MOMENTUM
+    # --------------------------------------------------------
+
     if momentum > 0:
+
         score += 1
+
         reasons.append(
             "Momentum positif"
         )
 
     elif momentum < 0:
+
         score -= 1
+
         reasons.append(
             "Momentum négatif"
         )
 
+    # --------------------------------------------------------
     # MACD
+    # --------------------------------------------------------
+
     if (
         macd > macd_signal
         and macd_histogram > 0
     ):
+
         score += 1
+
         reasons.append(
             "MACD haussier"
         )
@@ -513,32 +596,49 @@ def calculate_market_score(
         macd < macd_signal
         and macd_histogram < 0
     ):
+
         score -= 1
+
         reasons.append(
             "MACD baissier"
         )
 
-    # Tendance
+    # --------------------------------------------------------
+    # TENDANCE
+    # --------------------------------------------------------
+
     if score >= 3:
+
         trend = "BULLISH"
 
     elif score <= -3:
+
         trend = "BEARISH"
 
     else:
+
         trend = "NEUTRAL"
 
-    # Signal
+    # --------------------------------------------------------
+    # SIGNAL
+    # --------------------------------------------------------
+
     if score >= 4:
+
         signal = "BUY"
 
     elif score <= -4:
+
         signal = "SELL"
 
     else:
+
         signal = "WAIT"
 
-    # Confidence
+    # --------------------------------------------------------
+    # CONFIDENCE
+    # --------------------------------------------------------
+
     confidence = int(
         max(
             50,
@@ -549,20 +649,27 @@ def calculate_market_score(
         )
     )
 
-    # Qualité setup
+    # --------------------------------------------------------
+    # SETUP QUALITY
+    # --------------------------------------------------------
+
     if abs(score) >= 5:
+
         setup_state = "STRONG"
         setup_score = 90
 
     elif abs(score) >= 4:
+
         setup_state = "GOOD"
         setup_score = 75
 
     elif abs(score) >= 2:
+
         setup_state = "MODERATE"
         setup_score = 60
 
     else:
+
         setup_state = "WEAK"
         setup_score = 40
 
@@ -593,9 +700,11 @@ def build_trade_plan(
         "BUY",
         "SELL",
     ]:
+
         return None
 
     if atr <= 0:
+
         return None
 
     stop_distance = atr * 1.5
@@ -611,29 +720,35 @@ def build_trade_plan(
     if signal == "BUY":
 
         stop_loss = (
-            price - stop_distance
+            price
+            - stop_distance
         )
 
         take_profit_1 = (
-            price + tp1_distance
+            price
+            + tp1_distance
         )
 
         take_profit_2 = (
-            price + tp2_distance
+            price
+            + tp2_distance
         )
 
     else:
 
         stop_loss = (
-            price + stop_distance
+            price
+            + stop_distance
         )
 
         take_profit_1 = (
-            price - tp1_distance
+            price
+            - tp1_distance
         )
 
         take_profit_2 = (
-            price - tp2_distance
+            price
+            - tp2_distance
         )
 
     risk = abs(
@@ -662,36 +777,279 @@ def build_trade_plan(
 
     return {
         "direction": signal,
+
         "entry": round(
             price,
             5,
         ),
+
         "stop_loss": round(
             stop_loss,
             5,
         ),
+
         "take_profit_1": round(
             take_profit_1,
             5,
         ),
+
         "take_profit_2": round(
             take_profit_2,
             5,
         ),
+
         "risk_distance": round(
             risk,
             5,
         ),
+
         "rr_tp1": round(
             rr1,
             2,
         ),
+
         "rr_tp2": round(
             rr2,
             2,
         ),
+
         "method": "ATR",
     }
+
+
+# ============================================================
+# RISK MANAGEMENT
+# ============================================================
+
+def calculate_position_size(
+    account_balance: float,
+    risk_percent: float,
+    entry: float,
+    stop_loss: float,
+    pip_size: float = PIP_SIZE_EURUSD,
+    pip_value_per_lot: float = PIP_VALUE_PER_STANDARD_LOT,
+) -> Dict[str, Any]:
+
+    if account_balance <= 0:
+
+        raise ValueError(
+            "Le capital du compte doit être supérieur à 0."
+        )
+
+    if (
+        risk_percent < MIN_RISK_PERCENT
+        or risk_percent > MAX_RISK_PERCENT
+    ):
+
+        raise ValueError(
+            f"Le risque doit être compris entre "
+            f"{MIN_RISK_PERCENT}% et "
+            f"{MAX_RISK_PERCENT}%."
+        )
+
+    if entry <= 0 or stop_loss <= 0:
+
+        raise ValueError(
+            "Entry et Stop Loss doivent être supérieurs à 0."
+        )
+
+    stop_distance = abs(
+        entry - stop_loss
+    )
+
+    if stop_distance <= 0:
+
+        raise ValueError(
+            "La distance du Stop Loss doit être supérieure à 0."
+        )
+
+    risk_amount = (
+        account_balance
+        * risk_percent
+        / 100
+    )
+
+    stop_loss_pips = (
+        stop_distance
+        / pip_size
+    )
+
+    if stop_loss_pips <= 0:
+
+        raise ValueError(
+            "Distance SL en pips invalide."
+        )
+
+    position_size = (
+        risk_amount
+        / (
+            stop_loss_pips
+            * pip_value_per_lot
+        )
+    )
+
+    max_loss = (
+        position_size
+        * stop_loss_pips
+        * pip_value_per_lot
+    )
+
+    return {
+        "account_balance": round(
+            account_balance,
+            2,
+        ),
+
+        "risk_percent": round(
+            risk_percent,
+            2,
+        ),
+
+        "risk_amount": round(
+            risk_amount,
+            2,
+        ),
+
+        "stop_loss_pips": round(
+            stop_loss_pips,
+            2,
+        ),
+
+        "pip_value_per_lot": round(
+            pip_value_per_lot,
+            2,
+        ),
+
+        "position_size_lots": round(
+            position_size,
+            4,
+        ),
+
+        "max_loss": round(
+            max_loss,
+            2,
+        ),
+
+        "risk_valid": True,
+    }
+
+
+def validate_trade_plan(
+    trade_plan: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+
+    if not trade_plan:
+
+        return {
+            "valid": False,
+            "reason": "Aucun Trade Plan disponible.",
+        }
+
+    rr1 = trade_plan["rr_tp1"]
+    rr2 = trade_plan["rr_tp2"]
+
+    if rr1 < MIN_RR_TP1:
+
+        return {
+            "valid": False,
+            "reason": (
+                f"RR TP1 insuffisant: "
+                f"{rr1} < {MIN_RR_TP1}"
+            ),
+        }
+
+    if rr2 < MIN_RR_TP2:
+
+        return {
+            "valid": False,
+            "reason": (
+                f"RR TP2 insuffisant: "
+                f"{rr2} < {MIN_RR_TP2}"
+            ),
+        }
+
+    direction = trade_plan["direction"]
+    entry = trade_plan["entry"]
+    stop_loss = trade_plan["stop_loss"]
+    tp1 = trade_plan["take_profit_1"]
+    tp2 = trade_plan["take_profit_2"]
+
+    if direction == "BUY":
+
+        direction_valid = (
+            stop_loss < entry
+            and tp1 > entry
+            and tp2 > tp1
+        )
+
+    elif direction == "SELL":
+
+        direction_valid = (
+            stop_loss > entry
+            and tp1 < entry
+            and tp2 < tp1
+        )
+
+    else:
+
+        direction_valid = False
+
+    if not direction_valid:
+
+        return {
+            "valid": False,
+            "reason": (
+                "Incohérence directionnelle "
+                "du Trade Plan."
+            ),
+        }
+
+    return {
+        "valid": True,
+        "reason": "Trade Plan cohérent.",
+    }
+
+
+def build_risk_management(
+    trade_plan: Optional[Dict[str, Any]],
+    account_balance: float = DEFAULT_ACCOUNT_BALANCE,
+    risk_percent: float = DEFAULT_RISK_PERCENT,
+) -> Optional[Dict[str, Any]]:
+
+    if not trade_plan:
+
+        return None
+
+    try:
+
+        risk = calculate_position_size(
+            account_balance=account_balance,
+            risk_percent=risk_percent,
+            entry=trade_plan["entry"],
+            stop_loss=trade_plan["stop_loss"],
+        )
+
+        validation = validate_trade_plan(
+            trade_plan
+        )
+
+        risk["trade_plan_valid"] = validation[
+            "valid"
+        ]
+
+        risk["trade_plan_validation"] = (
+            validation["reason"]
+        )
+
+        return risk
+
+    except ValueError as exc:
+
+        return {
+            "risk_valid": False,
+            "trade_plan_valid": False,
+            "error": str(exc),
+        }
 
 
 # ============================================================
@@ -701,9 +1059,7 @@ def build_trade_plan(
 def dataframe_to_candles(
     df: pd.DataFrame,
     limit: int = 25,
-) -> List[Dict[str, Any]]:
-
-    result: List[Dict[str, Any]] = []
+) -> List[Dict[str, Any]] = []
 
     for _, row in df.tail(
         limit
@@ -753,6 +1109,8 @@ def run_analysis(
     asset: str = ASSET,
     timeframe: str = TIMEFRAME,
     candles: int = DEFAULT_CANDLES,
+    account_balance: float = DEFAULT_ACCOUNT_BALANCE,
+    risk_percent: float = DEFAULT_RISK_PERCENT,
 ) -> Dict[str, Any]:
 
     df = fetch_candles(
@@ -784,27 +1142,52 @@ def run_analysis(
         atr=atr,
     )
 
+    risk_management = build_risk_management(
+        trade_plan=trade_plan,
+        account_balance=account_balance,
+        risk_percent=risk_percent,
+    )
+
     latest_time = df.iloc[-1][
         "datetime"
     ]
 
     return {
         "status": "success",
+
         "engine_version": APP_VERSION,
+
         "source": "Twelve Data",
+
         "asset": asset.upper(),
-        "symbol": normalize_asset(asset),
+
+        "symbol": normalize_asset(
+            asset
+        ),
+
         "timeframe": timeframe,
+
         "price": round(
             price,
             6,
         ),
-        "signal": market["signal"],
+
+        "signal": market[
+            "signal"
+        ],
+
         "confidence": market[
             "confidence"
         ],
-        "score": market["score"],
-        "trend": market["trend"],
+
+        "score": market[
+            "score"
+        ],
+
+        "trend": market[
+            "trend"
+        ],
+
         "setup_quality": market[
             "setup_quality"
         ],
@@ -826,7 +1209,9 @@ def run_analysis(
             ),
 
             "momentum_5": round(
-                indicators["momentum_5"],
+                indicators[
+                    "momentum_5"
+                ],
                 4,
             ),
 
@@ -841,7 +1226,9 @@ def run_analysis(
             ),
 
             "macd_signal": round(
-                indicators["macd_signal"],
+                indicators[
+                    "macd_signal"
+                ],
                 6,
             ),
 
@@ -858,9 +1245,11 @@ def run_analysis(
                 2
                 if indicators["ema9"]
                 > indicators["ema21"]
+
                 else -2
                 if indicators["ema9"]
                 < indicators["ema21"]
+
                 else 0
             ),
 
@@ -925,9 +1314,13 @@ def run_analysis(
 
         "trade_plan": trade_plan,
 
+        "risk_management": risk_management,
+
         "data": {
             "candles_count": len(df),
-            "last_candle": latest_time.isoformat(),
+
+            "last_candle":
+                latest_time.isoformat(),
         },
     }
 
@@ -956,11 +1349,32 @@ def health() -> Dict[str, Any]:
         "engine_version": APP_VERSION,
         "asset": ASSET,
         "timeframe": TIMEFRAME,
+
         "twelve_data_configured": bool(
             os.getenv(
                 "TWELVE_DATA_API_KEY"
             )
         ),
+
+        "risk_management": {
+            "enabled": True,
+            "default_risk_percent":
+                DEFAULT_RISK_PERCENT,
+            "max_risk_percent":
+                MAX_RISK_PERCENT,
+        },
+    }
+
+
+@app.get("/version")
+def version() -> Dict[str, Any]:
+
+    return {
+        "status": "success",
+        "engine_version": APP_VERSION,
+        "service": "Pocket AI Trader",
+        "asset": ASSET,
+        "timeframe": TIMEFRAME,
     }
 
 
@@ -973,6 +1387,8 @@ def analyze(
         asset=request.asset,
         timeframe=request.timeframe,
         candles=request.candles,
+        account_balance=request.account_balance,
+        risk_percent=request.risk_percent,
     )
 
 
@@ -981,6 +1397,8 @@ def analyze_get(
     asset: str = ASSET,
     timeframe: str = TIMEFRAME,
     candles: int = DEFAULT_CANDLES,
+    account_balance: float = DEFAULT_ACCOUNT_BALANCE,
+    risk_percent: float = DEFAULT_RISK_PERCENT,
 ) -> Dict[str, Any]:
 
     candles = max(
@@ -995,6 +1413,8 @@ def analyze_get(
         asset=asset,
         timeframe=timeframe,
         candles=candles,
+        account_balance=account_balance,
+        risk_percent=risk_percent,
     )
 
 
@@ -1005,35 +1425,47 @@ def quick_analysis() -> Dict[str, Any]:
         asset=ASSET,
         timeframe=TIMEFRAME,
         candles=DEFAULT_CANDLES,
+        account_balance=DEFAULT_ACCOUNT_BALANCE,
+        risk_percent=DEFAULT_RISK_PERCENT,
     )
 
     return {
         "status": result["status"],
-        "engine_version": result[
-            "engine_version"
-        ],
-        "asset": result["asset"],
-        "timeframe": result[
-            "timeframe"
-        ],
-        "price": result["price"],
-        "signal": result["signal"],
-        "confidence": result[
-            "confidence"
-        ],
-        "score": result["score"],
-        "trend": result["trend"],
-        "setup_quality": result[
-            "setup_quality"
-        ],
-        "trade_plan": result[
-            "trade_plan"
-        ],
+
+        "engine_version":
+            result["engine_version"],
+
+        "asset":
+            result["asset"],
+
+        "timeframe":
+            result["timeframe"],
+
+        "price":
+            result["price"],
+
+        "signal":
+            result["signal"],
+
+        "confidence":
+            result["confidence"],
+
+        "score":
+            result["score"],
+
+        "trend":
+            result["trend"],
+
+        "trade_plan":
+            result["trade_plan"],
+
+        "risk_management":
+            result["risk_management"],
     }
 
 
 @app.get("/candles")
-def candles(
+def candles_endpoint(
     asset: str = ASSET,
     timeframe: str = TIMEFRAME,
     limit: int = 25,
@@ -1042,7 +1474,7 @@ def candles(
     limit = max(
         1,
         min(
-            MAX_CANDLES,
+            100,
             limit,
         ),
     )
@@ -1051,112 +1483,100 @@ def candles(
         asset=asset,
         timeframe=timeframe,
         outputsize=max(
-            DEFAULT_CANDLES,
+            MIN_CANDLES,
             limit,
         ),
     )
 
-    result = dataframe_to_candles(
-        df,
-        limit,
-    )
-
     return {
         "status": "success",
-        "source": "Twelve Data",
+        "engine_version": APP_VERSION,
         "asset": asset.upper(),
+        "symbol": normalize_asset(asset),
         "timeframe": timeframe,
-        "candles_count": len(result),
-        "candles": result,
+        "candles_count": len(df),
+        "candles": dataframe_to_candles(
+            df,
+            limit,
+        ),
     }
 
 
-# ============================================================
-# TEST TRADE PLAN
-# ============================================================
-
 @app.get("/test-trade-plan")
-def test_trade_plan(
-    signal: str = "BUY",
-    price: float = 1.13700,
-    atr: float = 0.00100,
-) -> Dict[str, Any]:
+def test_trade_plan() -> Dict[str, Any]:
 
-    signal = signal.strip().upper()
+    test_price = 1.1370
+    test_atr = 0.0010
 
-    if signal not in [
-        "BUY",
-        "SELL",
-    ]:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "signal doit être BUY ou SELL."
-            ),
-        )
-
-    if price <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "price doit être supérieur à 0."
-            ),
-        )
-
-    if atr <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "atr doit être supérieur à 0."
-            ),
-        )
+    signal = "BUY"
 
     trade_plan = build_trade_plan(
         signal=signal,
-        price=price,
-        atr=atr,
+        price=test_price,
+        atr=test_atr,
+    )
+
+    risk_management = build_risk_management(
+        trade_plan=trade_plan,
+        account_balance=DEFAULT_ACCOUNT_BALANCE,
+        risk_percent=DEFAULT_RISK_PERCENT,
     )
 
     return {
         "status": "success",
+
         "engine_version": APP_VERSION,
+
         "test": True,
+
         "signal": signal,
-        "price": price,
-        "atr": atr,
+
+        "price": test_price,
+
+        "atr": test_atr,
+
         "trade_plan": trade_plan,
+
+        "risk_management":
+            risk_management,
     }
 
 
-@app.get("/version")
-def version() -> Dict[str, Any]:
+@app.get("/test-risk")
+def test_risk(
+    account_balance: float = DEFAULT_ACCOUNT_BALANCE,
+    risk_percent: float = DEFAULT_RISK_PERCENT,
+) -> Dict[str, Any]:
 
-    return {
-        "engine_version": APP_VERSION,
-        "asset": ASSET,
-        "timeframe": TIMEFRAME,
-        "source": "Twelve Data",
-    }
+    test_entry = 1.1370
+    test_stop_loss = 1.1355
 
+    try:
 
-# ============================================================
-# LANCEMENT LOCAL
-# ============================================================
-
-if __name__ == "__main__":
-
-    import uvicorn
-
-    port = int(
-        os.getenv(
-            "PORT",
-            "8000",
+        risk = calculate_position_size(
+            account_balance=account_balance,
+            risk_percent=risk_percent,
+            entry=test_entry,
+            stop_loss=test_stop_loss,
         )
-    )
 
-    uvicorn.run(
-        "server:app",
-        host="0.0.0.0",
-        port=port,
-        reload=False,
-    )
+        return {
+            "status": "success",
+            "engine_version": APP_VERSION,
+            "test": True,
+
+            "entry": test_entry,
+
+            "stop_loss":
+                test_stop_loss,
+
+            "risk_management":
+                risk,
+        }
+
+    except ValueError as exc:
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+)
