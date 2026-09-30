@@ -197,9 +197,15 @@ def validate_risk_percent(
 
 def fetch_candles(asset: str, interval: str, candles: int):
     if not TWELVE_DATA_API_KEY:
-        raise ValueError("TWELVE_DATA_API_KEY n'est pas configurée.")
+        raise ValueError(
+            "TWELVE_DATA_API_KEY n'est pas configurée."
+        )
 
     symbol = normalize_asset(asset)
+
+    # Twelve Data utilise EUR/USD pour le Forex
+    if symbol.upper() == "EURUSD":
+        symbol = "EUR/USD"
 
     params = {
         "symbol": symbol,
@@ -215,16 +221,39 @@ def fetch_candles(asset: str, interval: str, candles: int):
         timeout=20,
     )
 
-    response.raise_for_status()
+    try:
+        data = response.json()
+    except ValueError:
+        raise ValueError(
+            f"Réponse Twelve Data non JSON "
+            f"(HTTP {response.status_code}): {response.text[:500]}"
+        )
 
-    data = response.json()
+    if response.status_code != 200:
+        raise ValueError(
+            f"Erreur Twelve Data HTTP {response.status_code}: "
+            f"{data}"
+        )
+
+    if data.get("status") == "error":
+        raise ValueError(
+            f"Erreur Twelve Data: "
+            f"{data.get('message', data)}"
+        )
 
     if "values" not in data:
         raise ValueError(
             f"Réponse Twelve Data invalide: {data}"
         )
 
-    return data["values"]
+    values = data["values"]
+
+    if not values:
+        raise ValueError(
+            "Twelve Data n'a retourné aucune bougie."
+        )
+
+    return values
 
 
 # ============================================================
