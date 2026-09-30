@@ -138,11 +138,14 @@ def safe_float(
 
 
 def normalize_asset(asset: str) -> str:
-    value = str(asset or ASSET).strip().upper()
+    asset = asset.strip().upper()
 
-    value = value.replace("/", "")
+    aliases = {
+        "EURUSD": "EUR/USD",
+        "EUR/USD": "EUR/USD",
+    }
 
-    return value
+    return aliases.get(asset, asset)
 
 
 def normalize_interval(timeframe: str) -> str:
