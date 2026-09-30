@@ -195,26 +195,36 @@ def validate_risk_percent(
 # TWELVE DATA
 # ============================================================
 
-def fetch_candles(
-    asset: str = ASSET,
-    timeframe: str = TIMEFRAME,
-    candles: int = DEFAULT_CANDLES,
-) -> pd.DataFrame:
-
+def fetch_candles(asset: str, interval: str, candles: int):
     if not TWELVE_DATA_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="TWELVE_DATA_API_KEY n'est pas configurée.",
+        raise ValueError("TWELVE_DATA_API_KEY n'est pas configurée.")
+
+    symbol = normalize_asset(asset)
+
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": candles,
+        "apikey": TWELVE_DATA_API_KEY,
+        "format": "JSON",
+    }
+
+    response = requests.get(
+        TWELVE_DATA_URL,
+        params=params,
+        timeout=20,
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if "values" not in data:
+        raise ValueError(
+            f"Réponse Twelve Data invalide: {data}"
         )
 
-    asset = normalize_asset(asset)
-
-    interval = normalize_interval(timeframe)
-
-    candles = max(
-        MIN_CANDLES,
-        min(int(candles), MAX_CANDLES),
-    )
+    return data["values"]
 
     params = {
         "symbol": asset,
