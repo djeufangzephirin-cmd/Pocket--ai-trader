@@ -1,8 +1,27 @@
+# Environnement et Secrets (CRITIQUE)
 .env
-.env.*
-!.env.example
+.env.local
+*.pem
+*.key
 
-browser_profile/
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Tests & Couverture
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs & Données locales
 *.log
+logs/
+data/
+*.sqlite
+*.db
