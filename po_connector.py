@@ -155,9 +155,6 @@ class PocketOptionConnector:
         call(...)
         sell(...)
         put(...)
-
-    The connector normalizes the result and returns True/False
-    to OrderManager.
     """
 
     def __init__(
@@ -189,15 +186,15 @@ class PocketOptionConnector:
         self.client = client
 
         self.connected = False
-
         self.authenticated = False
 
         self.last_error: Optional[str] = None
 
-        self.last_execution: Optional[Dict[str, Any]] = None
+        self.last_execution: Optional[
+            Dict[str, Any]
+        ] = None
 
         self._validate_configuration()
-
 
     # ========================================================
     # CONFIGURATION
@@ -224,7 +221,6 @@ class PocketOptionConnector:
                 "PO_EXECUTION_TIMEOUT invalide."
             )
 
-
     # ========================================================
     # STATUS
     # ========================================================
@@ -241,7 +237,6 @@ class PocketOptionConnector:
             "client_loaded": self.client is not None,
             "last_error": self.last_error,
         }
-
 
     # ========================================================
     # CLIENT INJECTION
@@ -263,16 +258,15 @@ class PocketOptionConnector:
             "Pocket Option client injecté."
         )
 
-
     # ========================================================
     # CONNECTION
     # ========================================================
 
     def connect(self) -> bool:
         """
-        Connect to the injected client.
+        Connecte le client injecté.
 
-        No credentials are collected here.
+        Les identifiants ne sont pas collectés ici.
         """
 
         if self.client is None:
@@ -309,9 +303,6 @@ class PocketOptionConnector:
 
             result = connect_method()
 
-            # Some clients return None but establish
-            # a connection successfully.
-
             if result is False:
 
                 self.last_error = (
@@ -326,7 +317,6 @@ class PocketOptionConnector:
 
             self.connected = True
             self.authenticated = True
-
             self.last_error = None
 
             logger.info(
@@ -339,7 +329,6 @@ class PocketOptionConnector:
 
             self.connected = False
             self.authenticated = False
-
             self.last_error = str(exc)
 
             logger.exception(
@@ -349,7 +338,6 @@ class PocketOptionConnector:
             raise ConnectorConnectionError(
                 f"Connexion impossible: {exc}"
             ) from exc
-
 
     # ========================================================
     # DISCONNECT
@@ -387,7 +375,6 @@ class PocketOptionConnector:
             "Pocket Option connector déconnecté."
         )
 
-
     # ========================================================
     # CONNECTION CHECK
     # ========================================================
@@ -398,7 +385,6 @@ class PocketOptionConnector:
             self.connected
             and self.authenticated
         )
-
 
     # ========================================================
     # LIVE SAFETY CHECK
@@ -435,7 +421,6 @@ class PocketOptionConnector:
                 "Le connecteur LIVE n'est "
                 "pas connecté/authentifié."
             )
-
 
     # ========================================================
     # ORDER VALIDATION
@@ -499,7 +484,6 @@ class PocketOptionConnector:
                 "Expiration minimale: 60 secondes."
             )
 
-
     # ========================================================
     # EXECUTE ORDER
     # ========================================================
@@ -509,16 +493,11 @@ class PocketOptionConnector:
         order: Any,
     ) -> bool:
         """
-        EXACT interface expected by OrderManager.
+        Interface exacte attendue par OrderManager.
 
         Returns:
-            True  -> order confirmed
-            False -> order not confirmed
-
-        Raises:
-            ConnectorExecutionError
-            LiveTradingDisabledError
-            ConnectorConnectionError
+            True  -> ordre confirmé
+            False -> ordre non confirmé
         """
 
         self._validate_order(order)
@@ -565,7 +544,6 @@ class PocketOptionConnector:
 
         return self._execute_live(order)
 
-
     # ========================================================
     # LIVE EXECUTION
     # ========================================================
@@ -582,12 +560,10 @@ class PocketOptionConnector:
                 "Client LIVE absent."
             )
 
-        direction = (
-            order.direction.upper()
-        )
+        direction = order.direction.upper()
 
         # ----------------------------------------------------
-        # Preferred generic interface
+        # GENERIC EXECUTION
         # ----------------------------------------------------
 
         execute_method = getattr(
@@ -600,9 +576,7 @@ class PocketOptionConnector:
 
             try:
 
-                result = execute_method(
-                    order
-                )
+                result = execute_method(order)
 
                 confirmed = (
                     self._normalize_execution_result(
@@ -639,9 +613,8 @@ class PocketOptionConnector:
                     f"Exécution LIVE échouée: {exc}"
                 ) from exc
 
-
         # ----------------------------------------------------
-        # Direction-specific fallback
+        # DIRECTION-SPECIFIC FALLBACK
         # ----------------------------------------------------
 
         if direction == "BUY":
@@ -714,7 +687,6 @@ class PocketOptionConnector:
                 f"Exécution LIVE échouée: {exc}"
             ) from exc
 
-
     # ========================================================
     # METHOD DISCOVERY
     # ========================================================
@@ -738,7 +710,6 @@ class PocketOptionConnector:
 
         return None
 
-
     # ========================================================
     # DIRECTION CALL
     # ========================================================
@@ -748,22 +719,6 @@ class PocketOptionConnector:
         method: Any,
         order: Any,
     ):
-
-        """
-        Calls a direction-specific client method.
-
-        The first preferred signature is:
-
-            method(asset, amount, expiration)
-
-        If the client rejects that signature, the connector
-        tries keyword arguments.
-
-        No blind retry is performed after a possible order
-        submission. This is intentional: automatically
-        repeating a failed request could create a duplicate
-        trade.
-        """
 
         try:
 
@@ -782,7 +737,6 @@ class PocketOptionConnector:
                     order.expiration_seconds
                 ),
             )
-
 
     # ========================================================
     # RESULT NORMALIZATION
@@ -820,9 +774,6 @@ class PocketOptionConnector:
                         result[key]
                     )
 
-            # An order id returned by a client is generally
-            # stronger evidence than a bare dictionary.
-
             for key in (
                 "order_id",
                 "id",
@@ -834,8 +785,6 @@ class PocketOptionConnector:
                     return True
 
             return False
-
-        # Some clients return objects.
 
         for attr in (
             "success",
@@ -873,7 +822,6 @@ class PocketOptionConnector:
 
         return False
 
-
     # ========================================================
     # RECORD EXECUTION
     # ========================================================
@@ -908,12 +856,13 @@ class PocketOptionConnector:
             order.amount,
         )
 
-
     # ========================================================
     # ACCOUNT / MARKET HELPERS
     # ========================================================
 
-    def get_balance(self) -> Optional[float]:
+    def get_balance(
+        self,
+    ) -> Optional[float]:
 
         if self.client is None:
             return None
@@ -935,6 +884,7 @@ class PocketOptionConnector:
 
                 try:
                     return float(result)
+
                 except (
                     TypeError,
                     ValueError,
@@ -945,6 +895,7 @@ class PocketOptionConnector:
 
                 try:
                     return float(attr)
+
                 except (
                     TypeError,
                     ValueError,
@@ -952,7 +903,6 @@ class PocketOptionConnector:
                     return None
 
         return None
-
 
     def get_payout(
         self,
@@ -973,20 +923,16 @@ class PocketOptionConnector:
 
         try:
 
-            result = method(
-                asset
-            )
+            result = method(asset)
 
             return float(result)
 
         except (
             TypeError,
             ValueError,
-            Exception,
         ):
 
             return None
-
 
     # ========================================================
     # HEALTH CHECK
@@ -1029,12 +975,12 @@ po_connector = PocketOptionConnector()
 # PUBLIC HELPERS
 # ============================================================
 
-def get_po_connector() ->PocketOptionConnector:
+def get_po_connector() -> PocketOptionConnector:
     return po_connector
 
 
 def get_connector_status() -> Dict[str, Any]:
-    return po_connector.get_status()
+    return po_connector.health_check()
 
 
 # ============================================================
@@ -1045,7 +991,6 @@ if __name__ == "__main__":
 
     from dataclasses import dataclass
 
-
     @dataclass
     class TestOrder:
 
@@ -1055,7 +1000,6 @@ if __name__ == "__main__":
         amount: float = 10.0
         payout: float = 85.0
         expiration_seconds: int = 60
-
 
     connector = PocketOptionConnector(
         mode="demo",
