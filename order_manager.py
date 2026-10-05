@@ -54,6 +54,53 @@ class OrderManager:
         execute_order(order) -> bool
     """
 
+    def execute_order(self, order):
+    """
+    Interface publique utilisée par le reste du système.
+
+    Reçoit un ordre sous forme de dictionnaire et le transmet
+    à submit_order(), qui contient la pipeline complète :
+    anti-doublon -> risk management -> connecteur -> persistence.
+    """
+
+    if not isinstance(order, dict):
+        return {
+            "status": "REJECTED",
+            "reason": "order doit être un dictionnaire",
+            "order_id": None,
+        }
+
+    required_fields = ["asset", "direction", "amount", "timeframe"]
+
+    missing = [
+        field for field in required_fields
+        if field not in order
+    ]
+
+    if missing:
+        return {
+            "status": "REJECTED",
+            "reason": f"Champs obligatoires manquants: {', '.join(missing)}",
+            "order_id": None,
+            "order": order,
+        }
+
+    try:
+        return self.submit_order(
+            asset=str(order["asset"]),
+            direction=str(order["direction"]),
+            amount=float(order["amount"]),
+            timeframe=int(order["timeframe"]),
+        )
+
+    except Exception as exc:
+        return {
+            "status": "ERROR",
+            "reason": str(exc),
+            "order_id": None,
+            "order": order,
+        }
+
     def __init__(
         self,
         connector,
