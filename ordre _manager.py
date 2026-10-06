@@ -274,6 +274,28 @@ class OrderManager:
         }
 
         self.order_history.append(record)
+            def execute_order(self, order: Dict[str, Any]) -> Dict[str, Any]:
+        """Interface publique d'exécution d'un ordre."""
+        asset = order.get("asset")
+        direction = order.get("direction")
+        amount = order.get("amount")
+        timeframe = order.get("timeframe", 60)
+
+        if not asset or not direction or amount is None:
+            return {
+                "status": "REJECTED",
+                "reason": "Paramètres d'ordre incomplets.",
+                "order_id": None,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "order": order,
+            }
+
+        return self.submit_order(
+            asset=asset,
+            direction=direction,
+            amount=float(amount),
+            timeframe=int(timeframe),
+        )
 
         # -----------------------------------------------------
         # 5. PERSISTANCE BASE DE DONNÉES
