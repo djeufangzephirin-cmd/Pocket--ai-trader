@@ -57,6 +57,12 @@ PO_LIVE_ENABLED = (
     == "true"
 )
 
+# Configuration déclarative seulement : ce module ne crée pas de transport
+# réseau. Un client injecté doit gérer explicitement son éventuel proxy.
+PO_PROXY_ENABLED = (
+    os.getenv("PO_PROXY_ENABLED", "false").strip().lower() == "true"
+)
+
 PO_CONNECT_TIMEOUT = int(
     os.getenv(
         "PO_CONNECT_TIMEOUT",
@@ -232,6 +238,7 @@ class PocketOptionConnector:
             "mode": self.mode,
             "trading_enabled": self.trading_enabled,
             "live_enabled": self.live_enabled,
+            "proxy_enabled": PO_PROXY_ENABLED,
             "connected": self.connected,
             "authenticated": self.authenticated,
             "client_loaded": self.client is not None,

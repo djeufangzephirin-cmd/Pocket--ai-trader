@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     TRADING_MODE: Literal["demo", "live"] = "demo"
     TRADING_ENABLED: bool = False
 
+    # Proxy facultatif : aucun identifiant requis lorsque désactivé.
+    # Le transport réseau reste à la charge du client injecté.
+    PO_PROXY_ENABLED: bool = False
+
     # Marché par défaut
     ASSET: str = "EURUSD"
     TIMEFRAME: str = "15m"

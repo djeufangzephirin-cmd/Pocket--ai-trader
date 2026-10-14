@@ -1234,8 +1234,8 @@ def build_trade_plan(
 # ============================================================
 # RISK MANAGEMENT
 # ============================================================
-    
-    def calculate_position_size(
+
+def calculate_position_size(
     account_balance: float,
     risk_percent: float,
     stop_loss_pips: float,
