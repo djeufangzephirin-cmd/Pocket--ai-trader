@@ -1,1 +1,1 @@
-# Pocket--ai-trader
+# Pocket-ai-trader
